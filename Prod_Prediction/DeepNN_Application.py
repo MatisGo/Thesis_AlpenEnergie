@@ -11,9 +11,9 @@ from dnn_app_utils_v3 import *
 # ========================================================================
 # HYPERPARAMETERS - EASY TO CHANGE
 # ========================================================================
-LEARNING_RATE = 0.1                                   # Learning rate for gradient descent (OPTIMAL for this problem)
+LEARNING_RATE = 0.5                                   # Learning rate for gradient descent (OPTIMAL for this problem)
 NUM_ITERATIONS = 3000                                 # Number of iterations for training
-LAYERS_DIMS = [9, 8, 8, 4, 8, 1]                      # Network architecture (9 input features)
+LAYERS_DIMS = [9, 9, 12, 15, 9, 1]                      # Network architecture (9 input features)
 PRINT_COST = False                                     # Print cost during training (TRUE to see if it's decreasing!)
 TEST_SIZE = 0.2                                        # Train/test split ratio
 RANDOM_STATE = 42                                      # Random seed for reproducibility
