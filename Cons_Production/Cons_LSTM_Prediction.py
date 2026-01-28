@@ -51,7 +51,7 @@ DROPOUT_RATE = 0.2                   # Dropout for regularization (prevents over
 PATIENCE = 10                        # Early stopping patience
 # ========================================================================
 # TARGET DATE TO PREDICT (excluded from training)
-TARGET_DATE = '2026-01-19'
+TARGET_DATE = '2026-01-18'
 # ========================================================================
 
 # 1 - LOAD AND PREPROCESS DATA
@@ -122,8 +122,9 @@ print("="*70)
 
 target_date = pd.to_datetime(TARGET_DATE).date()
 
-# Training data: all days except target date
-train_data = data_5min[data_5min['Date'] != target_date].copy()
+# Training data: all days BEFORE target date (exclude target date and future data)
+# This prevents data leakage - we can't use future data to predict the past
+train_data = data_5min[data_5min['Date'] < target_date].copy()
 
 # Test data: target date only
 test_data = data_5min[data_5min['Date'] == target_date].copy()

@@ -21,7 +21,7 @@ LOOKBACK_STEPS = 576                                  # 288 x 5min = 24 hours of
 PRINT_COST = False                                    # Print cost during training
 # ========================================================================
 # TARGET DATE TO PREDICT (excluded from training)
-TARGET_DATE = '2026-01-19'
+TARGET_DATE = '2026-01-18'
 # ========================================================================
 
 # 1 - LOAD AND PREPROCESS DATA
@@ -78,21 +78,22 @@ data_5min['Date'] = data_5min['DateTime'].dt.date
 print(f"\n5-minute data preview:")
 print(data_5min.head(10))
 
-# 2 - SPLIT DATA: EXCLUDE JANUARY 19TH FROM TRAINING
+# 2 - SPLIT DATA: EXCLUDE TARGET DATE AND FUTURE FROM TRAINING
 print("\n" + "="*70)
 print(f"SPLITTING DATA - EXCLUDING {TARGET_DATE} FOR PREDICTION")
 print("="*70)
 
 target_date = pd.to_datetime(TARGET_DATE).date()
 
-# Training data: all days except January 19th
-train_data = data_5min[data_5min['Date'] != target_date].copy()
+# Training data: all days BEFORE target date (exclude target date and future data)
+# This prevents data leakage - we can't use future data to predict the past
+train_data = data_5min[data_5min['Date'] < target_date].copy()
 
-# Test data: January 19th only
+# Test data: target date only
 test_data = data_5min[data_5min['Date'] == target_date].copy()
 
 print(f"Training data: {len(train_data)} intervals (5-min)")
-print(f"Test data (Jan 19): {len(test_data)} intervals (5-min)")
+print(f"Test data ({TARGET_DATE}): {len(test_data)} intervals (5-min)")
 
 # We need enough days before for lookback features
 # LOOKBACK_STEPS intervals at 5-min resolution = LOOKBACK_STEPS/288 days
