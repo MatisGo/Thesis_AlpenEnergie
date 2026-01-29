@@ -49,9 +49,10 @@ LOOKBACK_STEPS = 288                 # 288 x 5min = 24 hours of past data (reduc
 LSTM_UNITS = 64                      # Number of LSTM units (memory cells)
 DROPOUT_RATE = 0.2                   # Dropout for regularization (prevents overfitting)
 PATIENCE = 10                        # Early stopping patience
+SAVE_MODEL = True                    # Save model for real forecasting
 # ========================================================================
 # TARGET DATE TO PREDICT (excluded from training)
-TARGET_DATE = '2026-01-18'
+TARGET_DATE = '2026-01-27'
 # ========================================================================
 
 # 1 - LOAD AND PREPROCESS DATA
@@ -144,9 +145,9 @@ print("\n" + "="*70)
 print("PREPARING FEATURES FOR LSTM")
 print("="*70)
 
-# Define which features to use for the LSTM
+# Define which features to use for the LSTM SEQUENCE
 # LSTM will process these as a SEQUENCE over time
-FEATURE_COLUMNS = [
+SEQUENCE_FEATURES = [
     'Consumption',           # Main feature: past consumption values
     'Temperature',           # Actual temperature
     'Temperature_Predicted', # Forecasted temperature
@@ -157,12 +158,18 @@ FEATURE_COLUMNS = [
     'IsWeekend'             # Binary: is it weekend?
 ]
 
-print(f"Features used: {FEATURE_COLUMNS}")
-print(f"Number of features per timestep: {len(FEATURE_COLUMNS)}")
+# We also add the FUTURE temperature forecast as an extra feature
+# This is appended to every timestep in the sequence (same value repeated)
+# This allows the LSTM to "know" what temperature is expected at prediction time
+USE_FUTURE_TEMP = True
 
-def create_lstm_sequences(df, feature_cols, target_col, lookback_steps):
+print(f"Sequence features: {SEQUENCE_FEATURES}")
+print(f"Number of sequence features per timestep: {len(SEQUENCE_FEATURES)}")
+print(f"Using future temperature forecast: {USE_FUTURE_TEMP}")
+
+def create_lstm_sequences_with_future_temp(df, sequence_cols, target_col, lookback_steps, use_future_temp=True):
     """
-    Create sequences for LSTM training.
+    Create sequences for LSTM training with optional future temperature forecast.
 
     LSTM INPUT SHAPE EXPLANATION:
     -----------------------------
@@ -174,49 +181,58 @@ def create_lstm_sequences(df, feature_cols, target_col, lookback_steps):
     - timesteps: How many time steps in each sequence (LOOKBACK_STEPS)
     - num_features: How many features at each time step
 
-    Example with LOOKBACK_STEPS=288 and 8 features:
-    - Each sample is a 288x8 matrix (288 time steps, 8 features each)
-    - LSTM reads this row by row (time step by time step)
-    - At each step, it updates its internal memory based on the 8 features
+    WITH FUTURE TEMPERATURE:
+    -----------------------
+    We add an extra feature column that contains the temperature forecast
+    for the TARGET timestep (the one we're predicting). This value is the
+    same across all timesteps in the sequence, allowing the LSTM to use
+    this future information when making its prediction.
 
-    Visual representation of one sample:
+    Visual representation of one sample (with future temp):
 
-    Time    | Consumption | Temperature | Temp_Pred | Hour_sin | ... |
-    --------|-------------|-------------|-----------|----------|-----|
-    t-288   |    2100     |     5.2     |    5.0    |   0.26   | ... |
-    t-287   |    2050     |     5.1     |    5.0    |   0.26   | ... |
-    ...     |    ...      |    ...      |   ...     |   ...    | ... |
-    t-1     |    2200     |     6.0     |    6.2    |   0.97   | ... |
+    Time    | Consumption | Temperature | ... | Future_Temp |
+    --------|-------------|-------------|-----|-------------|
+    t-288   |    2100     |     5.2     | ... |     7.5     |  <- Same future temp
+    t-287   |    2050     |     5.1     | ... |     7.5     |  <- for all rows
+    ...     |    ...      |    ...      | ... |     7.5     |
+    t-1     |    2200     |     6.0     | ... |     7.5     |
 
-    Target: Consumption at time t (next value to predict)
+    Target: Consumption at time t (where temp forecast is 7.5)
     """
-    features = df[feature_cols].values
+    features = df[sequence_cols].values
     targets = df[target_col].values
     timestamps = df['DateTime'].values
+    temp_predicted = df['Temperature_Predicted'].values
 
-    X, y, ts = [], [], []
+    X, y, ts, future_temps = [], [], [], []
 
     # Slide a window of size 'lookback_steps' through the data
     for i in range(lookback_steps, len(df)):
         # Extract sequence: from (i - lookback_steps) to i
-        # This gives us 'lookback_steps' rows of data
-        X.append(features[i - lookback_steps:i])
+        sequence = features[i - lookback_steps:i].copy()
 
-        # Target is the consumption at position i (next value after sequence)
+        if use_future_temp:
+            # Get the temperature forecast for the TARGET timestep
+            future_temp = temp_predicted[i]
+
+            # Add future temp as an extra column (same value for all timesteps)
+            future_temp_col = np.full((lookback_steps, 1), future_temp)
+            sequence = np.hstack([sequence, future_temp_col])
+
+        X.append(sequence)
         y.append(targets[i])
-
-        # Store timestamp for the prediction
         ts.append(timestamps[i])
+        future_temps.append(temp_predicted[i] if use_future_temp else None)
 
-    # Convert to numpy arrays
-    # X shape: (num_samples, lookback_steps, num_features)
-    # y shape: (num_samples,)
-    return np.array(X), np.array(y), ts
+    return np.array(X), np.array(y), ts, future_temps
+
+# For saving - include future temp info
+FEATURE_COLUMNS = SEQUENCE_FEATURES + (['Future_Temp_Forecast'] if USE_FUTURE_TEMP else [])
 
 # Create training sequences
 print(f"\nCreating LSTM sequences with {LOOKBACK_STEPS} timesteps lookback...")
-X_train, y_train, timestamps_train = create_lstm_sequences(
-    train_data, FEATURE_COLUMNS, 'Consumption', LOOKBACK_STEPS
+X_train, y_train, timestamps_train, _ = create_lstm_sequences_with_future_temp(
+    train_data, SEQUENCE_FEATURES, 'Consumption', LOOKBACK_STEPS, USE_FUTURE_TEMP
 )
 
 print(f"Training sequences shape: {X_train.shape}")
@@ -235,8 +251,8 @@ combined_data = pd.concat([lookback_data, test_data]).reset_index(drop=True)
 print(f"Combined data for prediction: {len(combined_data)} intervals (5-min)")
 
 # Create test sequences
-X_test, y_test, timestamps_test = create_lstm_sequences(
-    combined_data, FEATURE_COLUMNS, 'Consumption', LOOKBACK_STEPS
+X_test, y_test, timestamps_test, _ = create_lstm_sequences_with_future_temp(
+    combined_data, SEQUENCE_FEATURES, 'Consumption', LOOKBACK_STEPS, USE_FUTURE_TEMP
 )
 
 # Filter to only include predictions for the target date
@@ -608,6 +624,54 @@ print(f"\nComputation Time: {training_time:.2f}s ({training_time/60:.2f} min)")
 print("\n" + "#"*70)
 print("### LSTM FORECASTING COMPLETE!")
 print("#"*70)
+
+# 14 - SAVE MODEL (if enabled)
+if SAVE_MODEL:
+    print("\n" + "="*70)
+    print("SAVING LSTM MODEL FOR REAL FORECASTING")
+    print("="*70)
+
+    # Save Keras model
+    model_filename = 'Cons_LSTM_Model.keras'
+    model.save(model_filename)
+    print(f"Keras model saved to: {model_filename}")
+
+    # Save scalers and configuration to .npz file
+    config_filename = 'Cons_LSTM_Config.npz'
+    np.savez(config_filename,
+             # Model configuration
+             lookback_steps=np.array(LOOKBACK_STEPS),
+             lstm_units=np.array(LSTM_UNITS),
+             dropout_rate=np.array(DROPOUT_RATE),
+             learning_rate=np.array(LEARNING_RATE),
+             use_future_temp=np.array(USE_FUTURE_TEMP),
+             # Feature columns (save as string)
+             feature_columns=np.array(FEATURE_COLUMNS),
+             sequence_features=np.array(SEQUENCE_FEATURES),
+             n_features=np.array(len(FEATURE_COLUMNS)),
+             # Scaler parameters for X (MinMaxScaler)
+             scaler_X_min=scaler_X.data_min_,
+             scaler_X_max=scaler_X.data_max_,
+             scaler_X_scale=scaler_X.scale_,
+             scaler_X_data_range=scaler_X.data_range_,
+             # Scaler parameters for y (MinMaxScaler)
+             scaler_y_min=scaler_y.data_min_,
+             scaler_y_max=scaler_y.data_max_,
+             scaler_y_scale=scaler_y.scale_,
+             scaler_y_data_range=scaler_y.data_range_,
+             # Training info
+             training_r2=np.array(r2_train),
+             training_mae=np.array(mae_train),
+             training_rmse=np.array(rmse_train),
+             epochs_trained=np.array(len(history.history['loss']))
+    )
+
+    print(f"Configuration saved to: {config_filename}")
+    print(f"  - Lookback steps: {LOOKBACK_STEPS}")
+    print(f"  - LSTM Units: {LSTM_UNITS}")
+    print(f"  - Features: {FEATURE_COLUMNS}")
+    print(f"  - Training R²: {r2_train:.4f}")
+    print("="*70)
 
 """
 TIPS FOR IMPROVING LSTM PERFORMANCE:
