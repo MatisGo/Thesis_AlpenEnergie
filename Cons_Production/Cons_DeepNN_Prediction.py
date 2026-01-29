@@ -17,11 +17,12 @@ from dnn_app_utils_v3 import *
 # ========================================================================
 LEARNING_RATE = 0.6                                   # Learning rate for gradient descent
 NUM_ITERATIONS = 3000                                 # Number of iterations for training
-LOOKBACK_STEPS = 576                                  # 288 x 5min = 24 hours of past data
+LOOKBACK_STEPS = 576                                  # 576 x 5min = 48 hours of past data
 PRINT_COST = False                                    # Print cost during training
+SAVE_MODEL = True                                     # Save model for real forecasting
 # ========================================================================
 # TARGET DATE TO PREDICT (excluded from training)
-TARGET_DATE = '2026-01-18'
+TARGET_DATE = '2026-01-27'
 # ========================================================================
 
 # 1 - LOAD AND PREPROCESS DATA
@@ -168,7 +169,7 @@ print(f"Total features: {len(feature_names)}")
 print(f"Training feature matrix shape: {X_train.shape}")
 print(f"Training target vector shape: {y_train.shape}")
 
-# 4 - CREATE FEATURES FOR JANUARY 19TH PREDICTION
+# 4 - CREATE FEATURES FOR JANUARY 18TH PREDICTION
 print("\n" + "="*70)
 print(f"CREATING FEATURES FOR {TARGET_DATE} PREDICTION")
 print("="*70)
@@ -182,8 +183,13 @@ X_test_list = []
 y_test_list = []
 timestamps_test = []
 
-# For each 15-min interval on January 19th, we need the previous 24 hours of data
+# For each 5-min interval on target date, we need the previous lookback hours of data
 for i in range(LOOKBACK_STEPS, len(combined_data)):
+    # Only include predictions for the TARGET DATE (filter out lookback days)
+    current_datetime = combined_data['DateTime'].iloc[i]
+    if current_datetime.date() != target_date:
+        continue  # Skip if not the target date
+
     feature_row = []
 
     # Past consumption (last 24 hours)
@@ -203,7 +209,7 @@ for i in range(LOOKBACK_STEPS, len(combined_data)):
     feature_row.append(future_temp_pred)
 
     # Time features for the target step
-    target_datetime = combined_data['DateTime'].iloc[i]
+    target_datetime = current_datetime
     feature_row.append(target_datetime.hour)
     feature_row.append(target_datetime.minute)
     feature_row.append(target_datetime.dayofweek)
@@ -441,3 +447,42 @@ print(f"\nComputation Time: {training_time:.2f}s ({training_time/60:.2f} min)")
 print("\n" + "#"*70)
 print("### FORECASTING COMPLETE!")
 print("#"*70)
+
+# 12 - SAVE MODEL (if enabled)
+if SAVE_MODEL:
+    print("\n" + "="*70)
+    print("SAVING MODEL FOR REAL FORECASTING")
+    print("="*70)
+
+    # Save model parameters and scalers to .npz file
+    model_filename = 'Cons_DeepNN_Model.npz'
+
+    # Prepare scaler parameters for saving
+    np.savez(model_filename,
+             # Model parameters (weights and biases)
+             **{f'W{l}': parameters[f'W{l}'] for l in range(1, len(LAYERS_DIMS))},
+             **{f'b{l}': parameters[f'b{l}'] for l in range(1, len(LAYERS_DIMS))},
+             # Model architecture
+             layers_dims=np.array(LAYERS_DIMS),
+             lookback_steps=np.array(LOOKBACK_STEPS),
+             # Scaler parameters for X (MinMaxScaler)
+             scaler_X_min=scaler_X.data_min_,
+             scaler_X_max=scaler_X.data_max_,
+             scaler_X_scale=scaler_X.scale_,
+             scaler_X_data_range=scaler_X.data_range_,
+             # Scaler parameters for y (MinMaxScaler)
+             scaler_y_min=scaler_y.data_min_,
+             scaler_y_max=scaler_y.data_max_,
+             scaler_y_scale=scaler_y.scale_,
+             scaler_y_data_range=scaler_y.data_range_,
+             # Training info
+             training_r2=np.array(r2_train),
+             training_mae=np.array(mae_train),
+             training_rmse=np.array(rmse_train)
+    )
+
+    print(f"Model saved to: {model_filename}")
+    print(f"  - Architecture: {LAYERS_DIMS}")
+    print(f"  - Lookback steps: {LOOKBACK_STEPS}")
+    print(f"  - Training R²: {r2_train:.4f}")
+    print("="*70)
