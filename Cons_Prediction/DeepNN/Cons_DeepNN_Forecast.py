@@ -24,14 +24,17 @@ from sklearn.preprocessing import MinMaxScaler
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
+# Import from parent directory
+import sys
+sys.path.append(os.path.dirname(SCRIPT_DIR))
 from dnn_app_utils_v3 import *
 
 # ========================================================================
 # FORECAST CONFIGURATION
 # ========================================================================
 FORECAST_DATE = '2026-01-28'          # Date to forecast (no actual values needed)
-MODEL_FILE = 'Cons_DeepNN_Model.npz'  # Saved model file from training
-DATA_FILE = 'Data_January.csv'        # Data file with historical data + temperature forecasts
+MODEL_FILE = 'Cons_DeepNN_Model.npz'  # Saved model file from training (in same folder)
+DATA_FILE = '../Data_January.csv'     # Data file (in parent folder)
 # ========================================================================
 
 print("="*70)

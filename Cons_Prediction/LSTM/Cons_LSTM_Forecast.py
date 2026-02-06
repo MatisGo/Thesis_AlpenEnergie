@@ -31,9 +31,9 @@ os.chdir(SCRIPT_DIR)
 # FORECAST CONFIGURATION
 # ========================================================================
 FORECAST_DATE = '2026-01-28'              # Date to forecast (no actual values needed)
-MODEL_FILE = 'Cons_LSTM_Model.keras'      # Saved Keras model
+MODEL_FILE = 'Cons_LSTM_Model.keras'      # Saved Keras model (in same folder)
 CONFIG_FILE = 'Cons_LSTM_Config.npz'      # Saved configuration and scalers
-DATA_FILE = 'Data_January.csv'            # Data file with historical data + temperature forecasts
+DATA_FILE = '../Data_January.csv'         # Data file (in parent folder)
 # ========================================================================
 
 print("="*70)
@@ -206,7 +206,9 @@ for i, pred_ts in enumerate(forecast_timestamps):
         temp_row = forecast_date_data[forecast_date_data['DateTime'] == pred_ts]
         if len(temp_row) > 0:
             future_temp = temp_row['Temperature_Predicted'].values[0]
-            temp_actual = temp_row['Temperature'].values[0] if 'Temperature' in temp_row.columns else future_temp
+            # Check if actual temperature is available (not NaN)
+            temp_val = temp_row['Temperature'].values[0]
+            temp_actual = temp_val if pd.notna(temp_val) else future_temp
         else:
             future_temp = rolling_buffer['Temperature_Predicted'].iloc[-1]
             temp_actual = rolling_buffer['Temperature'].iloc[-1]
@@ -284,31 +286,61 @@ results_filename = f'Cons_LSTM_Forecast_{FORECAST_DATE.replace("-", "")}_5min.cs
 results_df.to_csv(results_filename, index=False)
 print(f"\nForecast saved to: {results_filename}")
 
-# 7 - PLOT FORECAST
+# 7 - PLOT FORECAST WITH PREVIOUS DAY COMPARISON
 print("\n" + "="*70)
-print("GENERATING FORECAST PLOT")
+print("GENERATING FORECAST PLOT WITH PREVIOUS DAY COMPARISON")
 print("="*70)
 
-fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+# Get previous day's actual consumption for comparison
+prev_date = forecast_date - pd.Timedelta(days=1)
+prev_day_data = historical_data[historical_data['Date'] == prev_date].copy()
+
+if len(prev_day_data) > 0:
+    prev_consumption = prev_day_data['Consumption'].values
+    prev_times = prev_day_data['DateTime'].dt.strftime('%H:%M').values
+    print(f"Previous day ({prev_date}) data found: {len(prev_day_data)} values")
+else:
+    prev_consumption = None
+    print(f"No previous day data found for comparison")
+
+fig, ax = plt.subplots(1, 1, figsize=(16, 8))
 
 x_vals = np.arange(len(valid_timestamps))
 
-ax.plot(x_vals, predictions, 'b-', label='Predicted Consumption', linewidth=2)
-ax.fill_between(x_vals, 0, predictions, alpha=0.3, color='blue')
+# Plot forecast
+ax.plot(x_vals, predictions, 'b-', label=f'Forecast {FORECAST_DATE}', linewidth=2.5)
+ax.fill_between(x_vals, predictions.min() * 0.95, predictions, alpha=0.2, color='blue')
+
+# Plot previous day actual consumption if available
+if prev_consumption is not None and len(prev_consumption) == len(predictions):
+    ax.plot(x_vals, prev_consumption, 'g--', label=f'Actual {prev_date}', linewidth=2, alpha=0.8)
+    ax.fill_between(x_vals, predictions.min() * 0.95, prev_consumption, alpha=0.1, color='green')
+
+# Set Y-axis scale to show variation better (not starting from 0)
+all_values = list(predictions)
+if prev_consumption is not None and len(prev_consumption) == len(predictions):
+    all_values.extend(prev_consumption)
+y_min = min(all_values) * 0.9
+y_max = max(all_values) * 1.05
+ax.set_ylim(y_min, y_max)
 
 ax.set_xlabel('Time of Day', fontsize=12)
 ax.set_ylabel('Consumption (kW)', fontsize=12)
-ax.set_title(f'LSTM Consumption FORECAST for {FORECAST_DATE} (5-min resolution)\n'
+ax.set_title(f'LSTM Consumption FORECAST for {FORECAST_DATE} vs Previous Day\n'
              f'Model Training R²: {float(config["training_r2"]):.4f}',
              fontsize=14, fontweight='bold')
-ax.legend(fontsize=10, loc='upper right')
+ax.legend(fontsize=11, loc='upper left')
 ax.grid(True, alpha=0.3)
 
-# X-axis labels every hour
-tick_positions = np.arange(0, len(valid_timestamps), 12)
+# X-axis labels every 2 hours
+tick_positions = np.arange(0, len(valid_timestamps), 24)  # Every 2 hours (24 x 5min = 2h)
 tick_labels = [valid_timestamps[i].strftime('%H:%M') for i in tick_positions if i < len(valid_timestamps)]
 ax.set_xticks(tick_positions[:len(tick_labels)])
-ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+ax.set_xticklabels(tick_labels, rotation=0, ha='center', fontsize=10)
+
+# Add minor gridlines
+ax.minorticks_on()
+ax.grid(which='minor', alpha=0.15)
 
 plt.tight_layout()
 plot_filename = f'Cons_LSTM_Forecast_{FORECAST_DATE.replace("-", "")}_5min.png'
@@ -324,11 +356,29 @@ print("#"*70)
 print(f"\nForecast Date: {FORECAST_DATE}")
 print(f"Intervals Forecasted: {len(predictions)}")
 
-print(f"\n--- Daily Forecast ---")
+print(f"\n--- Daily Forecast ({FORECAST_DATE}) ---")
 print(f"Total Predicted Consumption: {predictions.sum() / 12:.2f} kWh")
 print(f"Average Predicted Power:     {predictions.mean():.2f} kW")
 print(f"Peak Predicted Power:        {predictions.max():.2f} kW at {valid_timestamps[predictions.argmax()].strftime('%H:%M')}")
 print(f"Min Predicted Power:         {predictions.min():.2f} kW at {valid_timestamps[predictions.argmin()].strftime('%H:%M')}")
+
+# Compare with previous day if available
+if prev_consumption is not None and len(prev_consumption) == len(predictions):
+    print(f"\n--- Previous Day ({prev_date}) Actual ---")
+    print(f"Total Actual Consumption:    {prev_consumption.sum() / 12:.2f} kWh")
+    print(f"Average Actual Power:        {prev_consumption.mean():.2f} kW")
+    print(f"Peak Actual Power:           {prev_consumption.max():.2f} kW")
+    print(f"Min Actual Power:            {prev_consumption.min():.2f} kW")
+
+    print(f"\n--- Comparison (Forecast vs Previous Day) ---")
+    total_diff = (predictions.sum() - prev_consumption.sum()) / 12
+    total_diff_pct = (predictions.sum() - prev_consumption.sum()) / prev_consumption.sum() * 100
+    print(f"Total Difference:            {total_diff:+.2f} kWh ({total_diff_pct:+.2f}%)")
+    print(f"Average Difference:          {predictions.mean() - prev_consumption.mean():+.2f} kW")
+
+    # Calculate correlation
+    correlation = np.corrcoef(predictions, prev_consumption)[0, 1]
+    print(f"Pattern Correlation:         {correlation:.4f}")
 
 print(f"\n--- Model Info ---")
 print(f"Model file: {MODEL_FILE}")

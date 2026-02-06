@@ -10,6 +10,9 @@ from sklearn.preprocessing import MinMaxScaler
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
+# Import from parent directory
+import sys
+sys.path.append(os.path.dirname(SCRIPT_DIR))
 from dnn_app_utils_v3 import *
 
 # ========================================================================
@@ -33,7 +36,7 @@ print(f"Resolution: 5 minutes")
 print("="*70)
 
 # Load data from CSV (skip first 3 header rows)
-data = pd.read_csv('Data_January.csv', skiprows=3, header=None, encoding='latin-1')
+data = pd.read_csv('../Data_January.csv', skiprows=3, header=None, encoding='latin-1')
 print(f"Loaded data shape: {data.shape}")
 
 # Assign column names based on the file structure
