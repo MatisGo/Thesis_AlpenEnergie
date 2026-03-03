@@ -1,0 +1,154 @@
+================================================================================
+DATA QUALITY REVIEW REPORT
+================================================================================
+
+Dataset Shape: 13248 rows x 18 columns
+Date Range: 2025-12-15 00:00:00 to 2026-01-28 23:55:00
+
+--------------------------------------------------------------------------------
+1. MISSING VALUES ANALYSIS
+--------------------------------------------------------------------------------
+
+Column                           Missing Count    Missing %
+------------------------------------------------------------
+DateTime_str                               288        2.17%
+Date                                       288        2.17%
+DayTime                                    288        2.17%
+Forecast_Prod                              575        4.34%
+Forecast_Load                              575        4.34%
+Consumption                                575        4.34%
+Production                                 575        4.34%
+Level_Bidmi                                575        4.34%
+Level_Haselholz                            575        4.34%
+Temperature                                575        4.34%
+Irradiance                                 575        4.34%
+Rain                                       575        4.34%
+SDR_Mode                                   575        4.34%
+Forecast_Mode                             1274        9.62%
+Transfer_Mode                              575        4.34%
+Waterlevel_Mode                            575        4.34%
+Temperature_Predicted                      288        2.17%
+DateTime                                   288        2.17%
+------------------------------------------------------------
+TOTAL                                     9614        4.03%
+
+--------------------------------------------------------------------------------
+2. OUTLIER ANALYSIS
+--------------------------------------------------------------------------------
+
+Column                       IQR Outliers   Z-Score Outliers     IF Outliers
+---------------------------------------------------------------------------
+Consumption                            77                 10             634
+Production                             17                 17             634
+Temperature                           645                  1             634
+Temperature_Predicted                 422                  0             634
+Irradiance                           2135                349             634
+Rain                                 2638                220             634
+Level_Bidmi                             0                  0             634
+Level_Haselholz                      1266                  9             634
+
+--------------------------------------------------------------------------------
+3. STATISTICAL SUMMARY
+--------------------------------------------------------------------------------
+
+Consumption:
+  Count:            12673
+  Mean:         2466.9814
+  Std:           327.2118
+  Min:          1423.1970
+  25%:          2237.8690
+  50%:          2473.4360
+  75%:          2675.3790
+  Max:          3641.9720
+
+Production:
+  Count:            12673
+  Mean:          923.2138
+  Std:           490.2257
+  Min:            -0.3780
+  25%:           541.4620
+  50%:           887.5980
+  75%:          1282.4020
+  Max:          2680.6440
+
+Temperature:
+  Count:            12673
+  Mean:            5.6172
+  Std:             4.1262
+  Min:            -2.8950
+  25%:             2.9900
+  50%:             5.0970
+  75%:             7.4810
+  Max:            17.9960
+
+Temperature_Predicted:
+  Count:            12960
+  Mean:            2.2418
+  Std:             4.4319
+  Min:           -10.6000
+  25%:             0.1000
+  50%:             2.6000
+  75%:             5.1000
+  Max:            12.8000
+
+Irradiance:
+  Count:            12673
+  Mean:           76.1596
+  Std:           159.0498
+  Min:             0.9460
+  25%:             1.4560
+  50%:             1.8360
+  75%:            58.8230
+  Max:          1159.8620
+
+Rain:
+  Count:            12673
+  Mean:            0.3151
+  Std:             1.1238
+  Min:             0.0000
+  25%:             0.0000
+  50%:             0.0000
+  75%:             0.0000
+  Max:             9.8000
+
+Level_Bidmi:
+  Count:            12673
+  Mean:            1.8535
+  Std:             0.2825
+  Min:             1.0140
+  25%:             1.6530
+  50%:             1.9010
+  75%:             2.0830
+  Max:             2.2660
+
+Level_Haselholz:
+  Count:            12673
+  Mean:            2.2651
+  Std:             0.4392
+  Min:             0.9310
+  25%:             2.1520
+  50%:             2.4130
+  75%:             2.5770
+  Max:             2.8060
+
+--------------------------------------------------------------------------------
+4. TEMPORAL GAPS ANALYSIS
+--------------------------------------------------------------------------------
+
+Found 1 temporal gaps in the data:
+  Gap at 2026-01-28 18:00:00: Duration = 0 days 01:05:00
+
+--------------------------------------------------------------------------------
+5. RECOMMENDATIONS
+--------------------------------------------------------------------------------
+- Handle missing values through interpolation or forward-fill
+- Review outliers in Temperature (645 detected)
+- Review outliers in Temperature_Predicted (422 detected)
+- Review outliers in Irradiance (2135 detected)
+- Review outliers in Rain (2638 detected)
+- Review outliers in Level_Haselholz (1266 detected)
+- Fill temporal gaps or handle them during sequence creation
+
+================================================================================
+END OF REPORT
+================================================================================
