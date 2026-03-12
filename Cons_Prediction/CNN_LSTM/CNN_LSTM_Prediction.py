@@ -25,7 +25,7 @@ Input 1 - Encoder (7-day lookback, 2016 steps x 11 features):
   Load_Is (past), Load_yesterday, Load_last_week,
   Hour_sin, Hour_cos, Weekday_sin, Weekday_cos,
   PHolyday, Temp_Forecast, Rain_Forecast,
-  Irr_Real  ← real irradiance sensor (added for solar context in encoder)
+  Irr_FC    ← API irradiance forecast (GHI from Open-Meteo, consistent source for encoder)
 
 Input 2 - Decoder conditioning (576 steps x 4 weekly profiles):
   Load from same weekday 1w, 2w, 3w, 4w ago for each forecast step
@@ -69,19 +69,20 @@ from tensorflow.keras.losses import Huber
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR  = os.path.join(SCRIPT_DIR, 'Simulation results')
-DATA_PATH    = os.path.join(SCRIPT_DIR, '..', 'Data_Prediction.xlsx')
-MODEL_PATH   = os.path.join(SCRIPT_DIR, 'CNN_LSTM_Model.keras')
-CONFIG_PATH  = os.path.join(SCRIPT_DIR, 'CNN_LSTM_Config.npz')
-PV_TABLE_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction_Table.npz')
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR   = os.path.join(SCRIPT_DIR, 'Simulation results')
+DATA_PATH     = os.path.join(SCRIPT_DIR, '..', 'Data_Prediction.xlsx')
+WEATHER_PATH  = os.path.join(SCRIPT_DIR, 'Imported_Forecast.xlsx')
+MODEL_PATH    = os.path.join(SCRIPT_DIR, 'Model', 'CNN_LSTM_Model.keras')
+CONFIG_PATH   = os.path.join(SCRIPT_DIR, 'Model', 'CNN_LSTM_Config.npz')
+PV_TABLE_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_Correction_Table.npz')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Data parameters
 LOOKBACK_STEPS = 2016       # 7 days * 288 steps/day (5-min resolution)
 FORECAST_HORIZON = 576      # 2 days * 288 steps/day
-STEP_SIZE = 1               # Sample every 30 min (reduces memory, keeps enough samples)
+STEP_SIZE = 6               # Sample every 30 min (reduces memory, keeps enough samples)
 METADATA_ROWS = 2           # Rows to skip in xlsx (Einheit, Signalname)
 TEST_DAYS = 10              # Last N days held out for testing
 
@@ -97,7 +98,7 @@ INPUT_FEATURES = [
     'PHolyday',             # Public holiday flag (0/1)
     'Temp_Forecast',        # Temperature forecast (deg C)
     'Rain_Forecast',        # Rain forecast (mm)
-    'Irr_Real',             # Real irradiance (W/m²) - solar context for encoder
+    'Irr_FC',               # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
 ]
 TARGET = 'Load_Is'
 
@@ -153,7 +154,7 @@ def load_pv_correction_table():
     if not os.path.exists(PV_TABLE_PATH):
         print(f"WARNING: PV correction table not found at {PV_TABLE_PATH}")
         print("  Run Build_PV_Correction_Table.py first to enable PV conditioning.")
-        print("  Training will proceed WITHOUT PV input (Irr_Real still in encoder).")
+        print("  Training will proceed WITHOUT PV input (Irr_FC still in encoder).")
         return None
 
     data = np.load(PV_TABLE_PATH)
@@ -167,111 +168,150 @@ def load_pv_correction_table():
 # DATA LOADING & PREPROCESSING
 # =============================================================================
 
+def _load_weather(path: str) -> pd.DataFrame:
+    """
+    Load Imported_Forecast.xlsx (produced by get_weather_data.py).
+
+    Returns DataFrame with columns: [DateTime, Temperature_C, Irradiance_Wm2, Rain_Sum_mm]
+    """
+    df_w = pd.read_excel(path, sheet_name='Weather_Data')
+    df_w['DateTime'] = pd.to_datetime(df_w['Time'], format='%d.%m.%Y %H:%M:%S',
+                                       errors='coerce')
+    df_w = df_w.dropna(subset=['DateTime'])
+    df_w['Temperature_C']  = pd.to_numeric(df_w['Temperature_C'],  errors='coerce')
+    df_w['Irradiance_Wm2'] = pd.to_numeric(df_w['Irradiance_Wm2'], errors='coerce').clip(lower=0)
+    df_w['Rain_Sum_mm']    = pd.to_numeric(df_w['Rain_Sum_mm'],    errors='coerce').fillna(0.0)
+    return df_w[['DateTime', 'Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm']]
+
+
 def load_data(ratio_table=None):
     """
-    Load and preprocess Data_Prediction.xlsx.
+    Load and preprocess data from two sources:
+      1. Data_Prediction.xlsx  — historical load, real sensor values (Irr_Real),
+                                 Forecast_Load (graph only), calendar features.
+      2. Imported_Forecast.xlsx — Open-Meteo API: Temperature, Irradiance (Irr_FC),
+                                   Rain. Covers historical + next 72h forecast.
 
-    Skips metadata rows, parses datetime, creates cyclical time encodings,
-    and handles missing values via interpolation.
+    Merge strategy (outer join on DateTime):
+      - Irr_Real      → real sensor 'Irradiance Meiringen' from Data_Prediction (kept for reference)
+      - Temp_Forecast → Temperature_C from Imported_Forecast (API replaces old forecast)
+      - Rain_Forecast → Rain_Sum_mm from Imported_Forecast (API replaces old forecast)
+      - Irr_FC        → Irradiance_Wm2 from Imported_Forecast (API source for BOTH encoder feature
+                         and PV_Est computation — single consistent irradiance source)
+      - Future rows (beyond Data_Prediction) → calendar features computed from DateTime,
+        Load_Is = NaN (enables 48h prediction beyond data end).
 
-    Also computes:
-      - Irr_Real: real irradiance sensor (encoder feature 11)
-      - Irr_FC:   irradiance forecast column (for PV estimate)
-      - PV_Est:   estimated PV production = Irr_FC × ratio_table[month-1, slot]
-                  (only if ratio_table is provided, else zeros)
-
-    Parameters
-    ----------
-    ratio_table : np.ndarray or None
-        PV correction table shape (12, 96) from load_pv_correction_table().
-        If None, PV_Est will be zero and Irr_Real will be zero-filled.
-
-    Returns
-    -------
-    df : pd.DataFrame
-        Preprocessed data with all required features.
+    Also computes PV_Est = Irr_FC × ratio_table[month, slot] if table is provided.
     """
-    print("Loading data from:", DATA_PATH)
-
+    # -------------------------------------------------------------------------
+    # 1. Load Data_Prediction.xlsx (historical: load, real sensors, calendar)
+    # -------------------------------------------------------------------------
+    print("Loading main data from:", DATA_PATH)
     df = pd.read_excel(DATA_PATH, header=0)
     df = df.iloc[METADATA_ROWS:].reset_index(drop=True)
     df.columns = [c.strip() for c in df.columns]
 
     # Parse datetime from Date (col B) + Day_Time (col C)
-    # Column 'Time' (col A) only covers up to 2026-02-22; Date+Day_Time is more complete
     date_part = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
     time_part = pd.to_timedelta(df['Day_Time'].astype(str), errors='coerce')
     df['DateTime'] = date_part + time_part
 
-    # Convert numeric columns
-    numeric_cols = ['Load_Is', 'Forecast_Load', 'Temp_Forecast', 'Rain_Forecast',
-                    'Weekday', 'PHolyday']
-    for col in numeric_cols:
+    # Numeric columns from main file
+    for col in ['Load_Is', 'Forecast_Load', 'Weekday', 'PHolyday']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Parse Day_Time → fractional hour → cyclical encoding
-    df['Day_Time_td'] = pd.to_timedelta(df['Day_Time'].astype(str), errors='coerce')
-    df['HourFrac'] = df['Day_Time_td'].dt.total_seconds() / 3600.0
-    df['Hour_sin'] = np.sin(2 * np.pi * df['HourFrac'] / 24)
-    df['Hour_cos'] = np.cos(2 * np.pi * df['HourFrac'] / 24)
-
-    # Weekday cyclical encoding
-    df['Weekday_sin'] = np.sin(2 * np.pi * df['Weekday'] / 7)
-    df['Weekday_cos'] = np.cos(2 * np.pi * df['Weekday'] / 7)
-
-    # Drop rows without valid datetime, sort chronologically
-    df = df.dropna(subset=['DateTime']).sort_values('DateTime').reset_index(drop=True)
-
-    # Interpolate missing values in continuous features
-    for col in ['Load_Is', 'Temp_Forecast', 'Rain_Forecast']:
-        df[col] = df[col].interpolate(method='linear').bfill().ffill()
-
-    # Fill PHolyday NaN with 0 (assume no holiday if missing)
-    df['PHolyday'] = df['PHolyday'].fillna(0)
-
-    # --- Lagged features ---
-    # Load at the same time yesterday (288 steps = 24h at 5-min)
-    df['Load_yesterday'] = df['Load_Is'].shift(288)
-    # Load at the same time last week (2016 steps = 7 days at 5-min)
-    df['Load_last_week'] = df['Load_Is'].shift(2016)
-    # Fill initial NaN from shifts with backward fill
-    df['Load_yesterday'] = df['Load_yesterday'].bfill()
-    df['Load_last_week'] = df['Load_last_week'].bfill()
-
-    # --- Irradiance features ---
-    # Real irradiance sensor (encoder feature: gives model solar context)
+    # Real irradiance sensor (kept from Data_Prediction — not replaced by API)
     irr_real_col = 'Irradiance Meiringen'
     if irr_real_col in df.columns:
-        df['Irr_Real'] = pd.to_numeric(df[irr_real_col], errors='coerce').fillna(0.0).clip(lower=0)
+        df['Irr_Real'] = pd.to_numeric(df[irr_real_col], errors='coerce').clip(lower=0)
     else:
         print(f"  WARNING: '{irr_real_col}' not found — Irr_Real set to 0")
         df['Irr_Real'] = 0.0
 
-    # Irradiance forecast (used to compute PV_Est for decoder conditioning)
-    irr_fc_col = 'Irradiance Forecast'
-    if irr_fc_col in df.columns:
-        df['Irr_FC'] = pd.to_numeric(df[irr_fc_col], errors='coerce').fillna(0.0).clip(lower=0)
-    else:
-        print(f"  WARNING: '{irr_fc_col}' not found — Irr_FC set to 0")
-        df['Irr_FC'] = 0.0
+    df = df.dropna(subset=['DateTime']).sort_values('DateTime').reset_index(drop=True)
 
-    # --- PV estimate via Lorenz (2011) correction table ---
-    # PV_Est[step] = Irr_FC[step] × ratio[month-1, 15min_slot]
-    # The correction table was built from 2 years of measured PV production.
+    # -------------------------------------------------------------------------
+    # 2. Load Imported_Forecast.xlsx (API: Temperature, Irradiance FC, Rain)
+    # -------------------------------------------------------------------------
+    if os.path.exists(WEATHER_PATH):
+        print("Loading weather data from:", WEATHER_PATH)
+        df_w = _load_weather(WEATHER_PATH)
+
+        # Outer merge: keeps all rows from both sources
+        # Future rows (only in df_w) will have NaN for load/grid columns
+        df = df.merge(df_w, on='DateTime', how='outer').sort_values('DateTime').reset_index(drop=True)
+        print(f"  Weather merge: {len(df_w)} API rows merged — "
+              f"future rows added: {(df['Load_Is'].isna() & df['Temperature_C'].notna()).sum()}")
+    else:
+        print(f"  WARNING: '{WEATHER_PATH}' not found — using Data_Prediction weather columns")
+        df['Temperature_C']  = pd.to_numeric(df.get('Temp_Forecast',  0), errors='coerce')
+        df['Irradiance_Wm2'] = pd.to_numeric(df.get('Irradiance Forecast', 0), errors='coerce').clip(lower=0)
+        df['Rain_Sum_mm']    = pd.to_numeric(df.get('Rain_Forecast',  0), errors='coerce').fillna(0)
+
+    # -------------------------------------------------------------------------
+    # 3. Compute / fill calendar features for ALL rows (incl. future API rows)
+    # -------------------------------------------------------------------------
+    # Hour cyclical encoding — computed from DateTime directly (always valid)
+    df['HourFrac'] = df['DateTime'].dt.hour + df['DateTime'].dt.minute / 60.0
+    df['Hour_sin'] = np.sin(2 * np.pi * df['HourFrac'] / 24)
+    df['Hour_cos'] = np.cos(2 * np.pi * df['HourFrac'] / 24)
+
+    # Weekday: fill NaN (future rows have no Weekday from Data_Prediction)
+    df['Weekday'] = df['Weekday'].fillna(df['DateTime'].dt.weekday.astype(float))
+    df['Weekday_sin'] = np.sin(2 * np.pi * df['Weekday'] / 7)
+    df['Weekday_cos'] = np.cos(2 * np.pi * df['Weekday'] / 7)
+
+    # PHolyday: default 0 for future rows (unknown)
+    df['PHolyday'] = df['PHolyday'].fillna(0)
+
+    # -------------------------------------------------------------------------
+    # 4. Map API weather columns → model feature names
+    # -------------------------------------------------------------------------
+    # Temp_Forecast: API temperature (replaces old 'Temp_Forecast' from Data_Prediction)
+    df['Temp_Forecast'] = df['Temperature_C'].fillna(
+        pd.to_numeric(df.get('Temp_Forecast', pd.Series(dtype=float)), errors='coerce'))
+
+    # Rain_Forecast: API daily rain sum (replaces old 'Rain_Forecast')
+    df['Rain_Forecast'] = df['Rain_Sum_mm'].fillna(0.0)
+
+    # Irr_FC: API irradiance forecast (replaces old 'Irradiance Forecast')
+    df['Irr_FC'] = df['Irradiance_Wm2'].fillna(0.0).clip(lower=0)
+
+    # Irr_Real: real sensor from Data_Prediction for historical rows
+    # For future rows (no sensor), use API irradiance as proxy
+    df['Irr_Real'] = df['Irr_Real'].fillna(df['Irradiance_Wm2']).fillna(0.0).clip(lower=0)
+
+    # -------------------------------------------------------------------------
+    # 5. Interpolate continuous features and compute lagged load
+    # -------------------------------------------------------------------------
+    for col in ['Temp_Forecast', 'Rain_Forecast']:
+        df[col] = df[col].interpolate(method='linear').bfill().ffill()
+
+    # Load_Is: only interpolate within historical region (not into future NaN)
+    df['Load_Is'] = df['Load_Is'].interpolate(method='linear', limit_direction='both',
+                                               limit_area='inside')
+
+    df['Load_yesterday'] = df['Load_Is'].shift(288).bfill()
+    df['Load_last_week'] = df['Load_Is'].shift(2016).bfill()
+
+    # -------------------------------------------------------------------------
+    # 6. PV estimate via Lorenz (2011) correction table
+    # -------------------------------------------------------------------------
     if ratio_table is not None:
-        months = df['DateTime'].dt.month.values - 1          # 0-indexed (0=Jan)
+        months = df['DateTime'].dt.month.values - 1
         slots  = (df['DateTime'].dt.hour * 4 +
-                  df['DateTime'].dt.minute // 15).values      # 0-95
+                  df['DateTime'].dt.minute // 15).values
         slots  = np.clip(slots, 0, 95)
         ratio_per_step = ratio_table[months, slots]
         df['PV_Est'] = (df['Irr_FC'].values * ratio_per_step).astype(np.float32)
     else:
         df['PV_Est'] = 0.0
 
-    print(f"  Loaded {len(df)} rows")
-    print(f"  Date range: {df['DateTime'].min()} to {df['DateTime'].max()}")
-    print(f"  Rows with Load_Is: {df['Load_Is'].notna().sum()}")
-    print(f"  PV_Est range: [{df['PV_Est'].min():.1f}, {df['PV_Est'].max():.1f}] kW")
+    print(f"  Total rows     : {len(df)}")
+    print(f"  Date range     : {df['DateTime'].min()} to {df['DateTime'].max()}")
+    print(f"  Rows with Load : {df['Load_Is'].notna().sum()}")
+    print(f"  Future rows    : {df['Load_Is'].isna().sum()}")
+    print(f"  PV_Est range   : [{df['PV_Est'].min():.1f}, {df['PV_Est'].max():.1f}] kW")
 
     return df
 
@@ -841,11 +881,20 @@ def run_train():
     n_train, n_steps, n_feat = X_train.shape
     n_test = X_test.shape[0]
 
+    # Fit scaler on raw feature columns, then apply via broadcasting.
+    # Using reshape(-1, n_feat) on the windowed array would allocate ~10 GB for
+    # long datasets (n_train * n_steps rows); broadcasting over the 3-D array
+    # is mathematically identical and uses only the working array memory.
     scaler_X = MinMaxScaler()
-    X_train_s = scaler_X.fit_transform(
-        X_train.reshape(-1, n_feat)).reshape(n_train, n_steps, n_feat)
-    X_test_s = scaler_X.transform(
-        X_test.reshape(-1, n_feat)).reshape(n_test, n_steps, n_feat)
+    scaler_X.fit(df[INPUT_FEATURES].dropna().values.astype(np.float32))
+    # MinMaxScaler formula: X_scaled = X * scale_ + min_  (both shape (n_feat,))
+    # Scale in-place to avoid creating a second large copy of the array.
+    X_train *= scaler_X.scale_
+    X_train += scaler_X.min_
+    X_train_s = X_train          # already scaled, same array
+    X_test *= scaler_X.scale_
+    X_test += scaler_X.min_
+    X_test_s = X_test            # already scaled, same array
 
     scaler_y = MinMaxScaler()
     y_train_s = scaler_y.fit_transform(y_train)
