@@ -1,0 +1,26 @@
+2026-03-12 19:42:21  INFO      ============================================================
+2026-03-12 19:42:21  INFO        AlpenEnergie Daily Forecast Runner
+2026-03-12 19:42:21  INFO        Predict date : 2026-03-12
+2026-03-12 19:42:21  INFO        Started at   : 2026-03-12 19:42:21
+2026-03-12 19:42:21  INFO      ============================================================
+2026-03-12 19:42:21  INFO      Step 1/2 — Updating weather data ...
+2026-03-12 19:42:41  INFO        Weather update complete.
+2026-03-12 19:42:41  INFO      Step 2/2 — Running CNN-LSTM forecast for 2026-03-12 ...
+2026-03-12 19:43:38  INFO        Forecast complete.
+2026-03-12 19:43:41  INFO      Success email sent to: matis.gourdes@proton.me
+2026-03-12 19:43:41  INFO      ============================================================
+2026-03-12 19:43:41  INFO        Pipeline complete in 77s
+2026-03-12 19:43:41  INFO      ============================================================
+2026-03-12 19:48:41  INFO      ============================================================
+2026-03-12 19:48:41  INFO        AlpenEnergie Daily Forecast Runner
+2026-03-12 19:48:41  INFO        Predict date : 2026-03-12
+2026-03-12 19:48:41  INFO        Started at   : 2026-03-12 19:48:41
+2026-03-12 19:48:41  INFO      ============================================================
+2026-03-12 19:48:41  INFO      Step 1/2 — Updating weather data ...
+2026-03-12 19:48:55  INFO        Weather update complete.
+2026-03-12 19:48:55  INFO      Step 2/2 — Running CNN-LSTM forecast for 2026-03-12 ...
+2026-03-12 19:50:01  INFO        Forecast complete.
+2026-03-12 19:50:03  INFO      Success email sent to: matis.gourdes@proton.me, timothee.devarax@gmail.com
+2026-03-12 19:50:03  INFO      ============================================================
+2026-03-12 19:50:03  INFO        Pipeline complete in 80s
+2026-03-12 19:50:03  INFO      ============================================================
