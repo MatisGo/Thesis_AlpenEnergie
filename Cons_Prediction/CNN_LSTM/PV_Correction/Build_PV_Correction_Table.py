@@ -2,7 +2,7 @@
 Build PV Irradiance-to-Power Correction Table
 ==============================================
 Constructs a month x 15-min-slot correction ratio table from two years of
-historical PV production and co-located irradiance forecast data.
+historical PV production and co-located GHI (Global Horizontal Irradiance) data.
 
 Scientific basis:
 -----------------
@@ -12,12 +12,19 @@ integration", Progress in Photovoltaics 19(7), DOI: 10.1002/pip.1033
 Bacher et al. (2009) "Online short-term solar power forecasting",
 Solar Energy 83(10), DOI: 10.1016/j.solener.2009.05.016
 
+Irradiance type:
+----------------
+This table uses GHI (Global Horizontal Irradiance), which includes both
+direct beam and diffuse components. GHI is consistent with the Open-Meteo
+shortwave_radiation output used in Imported_Forecast.xlsx, ensuring that
+the ratio table and the forecast irradiance are on the same physical basis.
+
 Method:
 -------
 For each (month m, 15-min slot s) bin, the correction ratio is:
 
-    ratio[m, s] = sum(PV_kW[m,s]) / sum(Irr_FC[m,s])
-                  --- only where Irr_FC > IRR_THRESHOLD W/m2 ---
+    ratio[m, s] = sum(PV_kW[m,s]) / sum(GHI[m,s])
+                  --- only where GHI > IRR_THRESHOLD W/m2 ---
 
 This gives the effective kW-per-(W/m2) conversion factor including:
   - Panel area and installed capacity
@@ -30,11 +37,11 @@ variation observed in the Meiringen valley between June and December.
 
 Usage in prediction:
 --------------------
-    PV_Est[step] = Irr_FC[step] * ratio[month - 1, slot_15min]
+    PV_Est[step] = GHI_forecast[step] * ratio[month - 1, slot_15min]
 
 Where:
-  - Irr_FC is the irradiance forecast for that 5-min step (W/m2)
-  - slot_15min = int(hour * 4 + minute // 15)  (0–95)
+  - GHI_forecast comes from Imported_Forecast.xlsx (Open-Meteo shortwave_radiation)
+  - slot_15min = int(hour * 4 + minute // 15)  (0-95)
   - month is 0-indexed (January = 0)
 
 Output:
@@ -47,9 +54,9 @@ PV production source:
 File: PV_Production_Forecast_23_24.xlsx
   - Period: 2023-01-01 to 2025-01-01 (2 full calendar years)
   - Resolution: 15 minutes (96 slots/day)
-  - Columns: Datum, Zeit, 'PV Production [kW]', Forecast (W/m2 irradiance FC)
+  - Columns: Datum, Zeit, 'PV Production [kW]', GHI (W/m2)
   - Max observed PV production: ~754 kW (July peak)
-  - Monthly peak means: June ~96.5 kW, December ~12 kW (ratio 8.0×)
+  - Monthly peak means: June ~96.5 kW, December ~12 kW (ratio 8.0x)
 """
 
 import os
@@ -61,8 +68,8 @@ import matplotlib.colors as mcolors
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PV_FILE    = os.path.join(SCRIPT_DIR, '..', 'PV_Production_Forecast_23_24.xlsx')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))        # .../PV_Correction/
+PV_FILE    = os.path.join(SCRIPT_DIR, '..', '..', 'PV_Production_Forecast_23_24.xlsx')
 OUT_NPZ    = os.path.join(SCRIPT_DIR, 'PV_Correction_Table.npz')
 OUT_CSV    = os.path.join(SCRIPT_DIR, 'PV_Correction_Table.csv')
 OUT_PLOT   = os.path.join(SCRIPT_DIR, 'PV_Correction_Table_Analysis.png')
@@ -100,7 +107,7 @@ def load_pv_data(path):
     Returns
     -------
     df : pd.DataFrame
-        Columns: DateTime (15-min), PV_kW, Irr_FC
+        Columns: DateTime (15-min), PV_kW, GHI
     """
     print(f"Loading PV data from: {path}")
     df = pd.read_excel(path, header=0)
@@ -117,23 +124,31 @@ def load_pv_data(path):
     time_part = pd.to_timedelta(df[time_col].astype(str), errors='coerce')
     df['DateTime'] = date_part + time_part
 
-    # --- Rename target columns (flexible: handle small naming variations) ---
+    # --- Identify PV production column (flexible naming) ---
     pv_col = [c for c in df.columns if 'PV' in c and 'kW' in c]
     if not pv_col:
         pv_col = [c for c in df.columns if 'production' in c.lower()]
-    irr_col = [c for c in df.columns if 'Forecast' in c or 'forecast' in c.lower()]
+
+    # --- Identify GHI irradiance column ---
+    # Accepts: GHI, Global, Horizontal, shortwave, radiation, Irradiance
+    # Also accepts old naming: Forecast, forecast (backwards compatible)
+    irr_keywords = ['GHI', 'Global', 'Horizontal', 'shortwave', 'radiation',
+                    'Irradiance', 'Forecast']
+    irr_col = [c for c in df.columns
+               if any(kw.lower() in c.lower() for kw in irr_keywords)
+               and c not in (pv_col or [])]
 
     if not pv_col or not irr_col:
-        print("ERROR: Could not identify PV Production and Forecast columns.")
+        print("ERROR: Could not identify PV Production and GHI columns.")
         print(f"  Available columns: {list(df.columns)}")
         raise ValueError("Check column names in PV file.")
 
     pv_col  = pv_col[0]
     irr_col = irr_col[0]
-    print(f"  Using: PV='{pv_col}', Irr_FC='{irr_col}'")
+    print(f"  Using: PV='{pv_col}', GHI='{irr_col}'")
 
-    df['PV_kW']  = pd.to_numeric(df[pv_col],  errors='coerce').fillna(0.0)
-    df['Irr_FC'] = pd.to_numeric(df[irr_col], errors='coerce').fillna(0.0)
+    df['PV_kW'] = pd.to_numeric(df[pv_col],  errors='coerce').fillna(0.0)
+    df['GHI']   = pd.to_numeric(df[irr_col], errors='coerce').fillna(0.0)
 
     # --- Keep only rows with valid DateTime ---
     df = df.dropna(subset=['DateTime']).sort_values('DateTime').reset_index(drop=True)
@@ -146,7 +161,7 @@ def load_pv_data(path):
 
     print(f"  Date range: {df['DateTime'].min()} → {df['DateTime'].max()}")
     print(f"  PV range:   [{df['PV_kW'].min():.1f}, {df['PV_kW'].max():.1f}] kW")
-    print(f"  Irr_FC range: [{df['Irr_FC'].min():.1f}, {df['Irr_FC'].max():.1f}] W/m²")
+    print(f"  GHI range: [{df['GHI'].min():.1f}, {df['GHI'].max():.1f}] W/m²")
 
     return df
 
@@ -157,8 +172,8 @@ def load_pv_data(path):
 
 def build_correction_table(df, irr_threshold=IRR_THRESHOLD, min_samples=MIN_SAMPLES):
     """
-    Compute ratio[month, slot] = sum(PV_kW) / sum(Irr_FC)
-    for valid daytime samples only (Irr_FC > threshold).
+    Compute ratio[month, slot] = sum(PV_kW) / sum(GHI)
+    for valid daytime samples only (GHI > threshold).
 
     Using sum/sum rather than mean(PV)/mean(Irr) avoids noise from
     partially-cloudy samples where the ratio is ill-conditioned.
@@ -169,7 +184,7 @@ def build_correction_table(df, irr_threshold=IRR_THRESHOLD, min_samples=MIN_SAMP
     df : pd.DataFrame
         Output of load_pv_data().
     irr_threshold : float
-        Minimum Irr_FC to include (W/m²).
+        Minimum GHI to include (W/m²).
     min_samples : int
         Minimum samples per bin to compute a ratio.
 
@@ -184,10 +199,10 @@ def build_correction_table(df, irr_threshold=IRR_THRESHOLD, min_samples=MIN_SAMP
     n_table     = np.zeros((MONTHS, SLOTS), dtype=np.int32)
 
     # Filter: both irradiance and PV must be meaningful
-    mask = (df['Irr_FC'] > irr_threshold) & (df['PV_kW'] >= 0)
+    mask = (df['GHI'] > irr_threshold) & (df['PV_kW'] >= 0)
     df_valid = df[mask].copy()
 
-    print(f"\n  Valid samples (Irr_FC > {irr_threshold} W/m²): "
+    print(f"\n  Valid samples (GHI > {irr_threshold} W/m²): "
           f"{len(df_valid)} / {len(df)} ({100*len(df_valid)/len(df):.1f}%)")
 
     for m in range(1, MONTHS + 1):
@@ -196,9 +211,9 @@ def build_correction_table(df, irr_threshold=IRR_THRESHOLD, min_samples=MIN_SAMP
             n   = len(sub)
             n_table[m - 1, s] = n
 
-            if n >= min_samples and sub['Irr_FC'].sum() > 0:
-                # sum(PV_kW) / sum(Irr_FC)  [kW / (W/m²)]
-                ratio_table[m - 1, s] = sub['PV_kW'].sum() / sub['Irr_FC'].sum()
+            if n >= min_samples and sub['GHI'].sum() > 0:
+                # sum(PV_kW) / sum(GHI)  [kW / (W/m²)]
+                ratio_table[m - 1, s] = sub['PV_kW'].sum() / sub['GHI'].sum()
             # else: ratio stays 0 (night/winter slots with no reliable data)
 
     # Summary statistics
@@ -355,14 +370,14 @@ def validate_correction_table(df, ratio_table):
     Apply the correction table back to the training data and compare
     PV_Est vs PV_kW. Reports MAE and correlation as a sanity check.
     """
-    mask = (df['Irr_FC'] > IRR_THRESHOLD) & (df['PV_kW'] > 0)
+    mask = (df['GHI'] > IRR_THRESHOLD) & (df['PV_kW'] > 0)
     df_val = df[mask].copy()
 
     months = df_val['Month'].values - 1       # 0-indexed
     slots  = df_val['Slot_15min'].values       # 0-95
     ratio_per_row = ratio_table[months, slots]
 
-    df_val['PV_Est'] = df_val['Irr_FC'].values * ratio_per_row
+    df_val['PV_Est'] = df_val['GHI'].values * ratio_per_row
 
     # Metrics
     pv_est = df_val['PV_Est'].values
