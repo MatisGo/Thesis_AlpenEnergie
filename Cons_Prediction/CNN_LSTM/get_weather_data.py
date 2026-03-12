@@ -9,7 +9,7 @@ Two API calls are combined:
   2. Forecast API : next 72h forecast, ending at midnight 3 days from now
 
 Location  : Meiringen (lat=46.7286, lon=8.1750)
-Variables : temperature_2m (C), shortwave_radiation (W/m2), rain_sum (mm/day)
+Variables : temperature_2m (C), shortwave_radiation (W/m2), rain_sum (mm/day), cloudcover (%)
 Output    : Test_Data_Import.xlsx  (Time | Date | Time_Only | ...)
 
 Rain columns:
@@ -74,12 +74,14 @@ def _parse_response(resp: requests.Response) -> tuple[pd.DataFrame, dict]:
         raise RuntimeError("Unexpected response format from Open-Meteo.")
 
     df = pd.DataFrame({
-        "DateTime":       pd.to_datetime(hourly["time"]),
-        "Temperature_C":  pd.to_numeric(hourly["temperature_2m"],     errors="coerce"),
-        "Irradiance_Wm2": pd.to_numeric(hourly["shortwave_radiation"], errors="coerce"),
+        "DateTime":         pd.to_datetime(hourly["time"]),
+        "Temperature_C":    pd.to_numeric(hourly["temperature_2m"],     errors="coerce"),
+        "Irradiance_Wm2":   pd.to_numeric(hourly["shortwave_radiation"], errors="coerce"),
+        "Cloud_Cover_Pct":  pd.to_numeric(hourly["cloudcover"],          errors="coerce"),
     })
-    df["Temperature_C"]  = df["Temperature_C"].interpolate(method="linear")
-    df["Irradiance_Wm2"] = df["Irradiance_Wm2"].interpolate(method="linear").clip(lower=0)
+    df["Temperature_C"]   = df["Temperature_C"].interpolate(method="linear")
+    df["Irradiance_Wm2"]  = df["Irradiance_Wm2"].interpolate(method="linear").clip(lower=0)
+    df["Cloud_Cover_Pct"] = df["Cloud_Cover_Pct"].interpolate(method="linear").clip(0, 100)
 
     # --- Daily rain sum -> {date: mm} ---
     daily    = payload.get("daily", {})
@@ -99,7 +101,7 @@ def fetch_historical() -> tuple[pd.DataFrame, dict]:
         "longitude":  LON,
         "start_date": START_DATE,
         "end_date":   TODAY.strftime("%Y-%m-%d"),
-        "hourly":     "temperature_2m,shortwave_radiation",
+        "hourly":     "temperature_2m,shortwave_radiation,cloudcover",
         "daily":      "rain_sum",
         "timezone":   TIMEZONE,
     }
@@ -119,7 +121,7 @@ def fetch_forecast() -> tuple[pd.DataFrame, dict]:
     params = {
         "latitude":      LAT,
         "longitude":     LON,
-        "hourly":        "temperature_2m,shortwave_radiation",
+        "hourly":        "temperature_2m,shortwave_radiation,cloudcover",
         "daily":         "rain_sum",
         "timezone":      TIMEZONE,
         "forecast_days": 5,
@@ -161,12 +163,15 @@ def interpolate_to_5min(df: pd.DataFrame) -> pd.DataFrame:
     out = {"DateTime": [origin + datetime.timedelta(minutes=float(m))
                         for m in t_5min]}
 
-    for col in ["Temperature_C", "Irradiance_Wm2"]:
+    for col in ["Temperature_C", "Irradiance_Wm2", "Cloud_Cover_Pct"]:
+        kind     = "linear" if col == "Cloud_Cover_Pct" else "cubic"
         f        = interp1d(t_hours, df[col].values.astype(float),
-                            kind="cubic", fill_value="extrapolate")
+                            kind=kind, fill_value="extrapolate")
         interped = f(t_5min)
         if col == "Irradiance_Wm2":
             interped = np.maximum(interped, 0.0)
+        if col == "Cloud_Cover_Pct":
+            interped = np.clip(interped, 0.0, 100.0)
         out[col] = np.round(interped, 2)
 
     return pd.DataFrame(out)
@@ -212,7 +217,7 @@ def format_output(df: pd.DataFrame) -> pd.DataFrame:
     df["Time_Only"] = df["DateTime"].dt.strftime("%H:%M:%S")
     return df[["Time", "Date", "Time_Only",
                "Temperature_C", "Irradiance_Wm2",
-               "Rain_Sum_mm"]]
+               "Rain_Sum_mm", "Cloud_Cover_Pct"]]
 
 
 # =============================================================================

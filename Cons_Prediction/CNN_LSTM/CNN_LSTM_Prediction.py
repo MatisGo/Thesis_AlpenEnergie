@@ -66,6 +66,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCh
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
 
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -99,6 +100,7 @@ INPUT_FEATURES = [
     'Temp_Forecast',        # Temperature forecast (deg C)
     'Rain_Forecast',        # Rain forecast (mm)
     'Irr_FC',               # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
+    'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
 ]
 TARGET = 'Load_Is'
 
@@ -120,7 +122,9 @@ DROPOUT_RATE = 0.2
 
 # Training
 LEARNING_RATE = 0.001
-EPOCHS = 100
+EPOCHS        = 100
+VAL_RATIO     = 0.15   # Fraction of training samples randomly drawn for validation
+
 BATCH_SIZE = 32
 PATIENCE = 15
 
@@ -181,7 +185,13 @@ def _load_weather(path: str) -> pd.DataFrame:
     df_w['Temperature_C']  = pd.to_numeric(df_w['Temperature_C'],  errors='coerce')
     df_w['Irradiance_Wm2'] = pd.to_numeric(df_w['Irradiance_Wm2'], errors='coerce').clip(lower=0)
     df_w['Rain_Sum_mm']    = pd.to_numeric(df_w['Rain_Sum_mm'],    errors='coerce').fillna(0.0)
-    return df_w[['DateTime', 'Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm']]
+    # Cloud cover — present only after get_weather_data.py was updated; default 50% if missing
+    if 'Cloud_Cover_Pct' in df_w.columns:
+        df_w['Cloud_Cover_Pct'] = pd.to_numeric(df_w['Cloud_Cover_Pct'], errors='coerce').clip(0, 100).fillna(50.0)
+    else:
+        print("  WARNING: 'Cloud_Cover_Pct' not in weather file — defaulting to 50%. Re-run get_weather_data.py.")
+        df_w['Cloud_Cover_Pct'] = 50.0
+    return df_w[['DateTime', 'Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm', 'Cloud_Cover_Pct']]
 
 
 def load_data(ratio_table=None):
@@ -276,6 +286,10 @@ def load_data(ratio_table=None):
 
     # Irr_FC: API irradiance forecast (replaces old 'Irradiance Forecast')
     df['Irr_FC'] = df['Irradiance_Wm2'].fillna(0.0).clip(lower=0)
+
+    # Cloud_Cover: total cloud cover % from API (50% neutral fallback)
+    df['Cloud_Cover'] = df['Cloud_Cover_Pct'].fillna(50.0).clip(0, 100) \
+        if 'Cloud_Cover_Pct' in df.columns else 50.0
 
     # Irr_Real: real sensor from Data_Prediction for historical rows
     # For future rows (no sensor), use API irradiance as proxy
@@ -928,6 +942,23 @@ def run_train():
 
     # 6. Train with triple inputs
     print("\n--- Step 6: Training ---")
+
+    # Random validation split — drawn uniformly across all seasons so the
+    # validation set is not biased toward the most recent months.
+    val_size  = max(1, int(n_train * VAL_RATIO))
+    val_idx   = np.random.choice(n_train, size=val_size, replace=False)
+    train_idx = np.setdiff1d(np.arange(n_train), val_idx)
+
+    def _split(arr):
+        return arr[train_idx], arr[val_idx]
+
+    Xt, Xv         = _split(X_train_s)
+    St, Sv         = _split(stat_train_s)
+    Pt, Pv         = _split(pv_train_s)
+    yt, yv         = _split(y_train_s)
+    print(f"  Train samples: {len(train_idx)}  |  Val samples: {len(val_idx)}  "
+          f"(random {VAL_RATIO*100:.0f}% across all seasons)")
+
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6),
@@ -936,10 +967,11 @@ def run_train():
 
     start_time = time.time()
     history = model.fit(
-        [X_train_s, stat_train_s, pv_train_s], y_train_s,
-        validation_split=0.2,
+        [Xt, St, Pt], yt,
+        validation_data=([Xv, Sv, Pv], yv),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
+        shuffle=True,
         callbacks=callbacks,
         verbose=1
     )
