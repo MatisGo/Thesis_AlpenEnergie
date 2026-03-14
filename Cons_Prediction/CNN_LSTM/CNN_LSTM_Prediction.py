@@ -74,15 +74,21 @@ SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR   = os.path.join(SCRIPT_DIR, 'Simulation results')
 DATA_PATH     = os.path.join(SCRIPT_DIR, '..', 'Data_Prediction.xlsx')
 WEATHER_PATH  = os.path.join(SCRIPT_DIR, 'Imported_Forecast.xlsx')
-MODEL_PATH    = os.path.join(SCRIPT_DIR, 'Model', 'CNN_LSTM_Model.keras')
-CONFIG_PATH   = os.path.join(SCRIPT_DIR, 'Model', 'CNN_LSTM_Config.npz')
 PV_TABLE_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_Correction_Table.npz')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# Output horizon — single source of truth. Only OUTPUT_HOURS is edited directly.
+OUTPUT_HOURS     = 48   # Default forecast horizon in hours (48h Mon-Thu, 96h Fri-Sun)
+STEPS_PER_HOUR   = 12   # 5-min resolution: 60/5 = 12 steps per hour
+FORECAST_HORIZON = OUTPUT_HOURS * STEPS_PER_HOUR   # derived — do not edit directly
+
+# Model/config paths — resolved from OUTPUT_HOURS at startup (or overridden via --hours)
+MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{OUTPUT_HOURS}h.keras')
+CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{OUTPUT_HOURS}h.npz')
+
 # Data parameters
 LOOKBACK_STEPS = 2016       # 7 days * 288 steps/day (5-min resolution)
-FORECAST_HORIZON = 576      # 2 days * 288 steps/day
 STEP_SIZE = 6               # Sample every 30 min (reduces memory, keeps enough samples)
 METADATA_ROWS = 2           # Rows to skip in xlsx (Einheit, Signalname)
 TEST_DAYS = 10              # Last N days held out for testing
@@ -103,10 +109,6 @@ INPUT_FEATURES = [
     'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
 ]
 TARGET = 'Load_Is'
-
-# Output reshaping: 48 hourly blocks x 12 steps (5-min) per block = 576
-OUTPUT_HOURS = 48
-STEPS_PER_HOUR = 12
 
 # CNN architecture
 CNN_FILTERS = [64, 128, 256]
@@ -397,7 +399,7 @@ def create_sequences(df, step=STEP_SIZE):
 # STATISTICAL PROFILES FOR DECODER CONDITIONING
 # =============================================================================
 
-def build_stat_profiles(load_values, start_indices, horizon=FORECAST_HORIZON,
+def build_stat_profiles(load_values, start_indices, horizon=None,
                         n_weeks=STAT_N_WEEKS):
     """
     Build same-weekday statistical profiles for the forecast horizon.
@@ -422,6 +424,8 @@ def build_stat_profiles(load_values, start_indices, horizon=FORECAST_HORIZON,
     profiles : np.ndarray, shape (n_samples, horizon, n_weeks)
         Load values from past same-weekdays for each forecast step.
     """
+    if horizon is None:
+        horizon = FORECAST_HORIZON   # read global at call time, not at definition time
     n = len(start_indices)
     profiles = np.full((n, horizon, n_weeks), np.nan, dtype=np.float32)
 
@@ -454,8 +458,8 @@ def build_stat_profiles(load_values, start_indices, horizon=FORECAST_HORIZON,
 # MODEL ARCHITECTURE
 # =============================================================================
 
-def build_model(input_shape, stat_shape, pv_shape, output_hours=OUTPUT_HOURS,
-                steps_per_hour=STEPS_PER_HOUR):
+def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
+                steps_per_hour=None):
     """
     Build CNN-LSTM model with triple decoder conditioning.
 
@@ -485,6 +489,11 @@ def build_model(input_shape, stat_shape, pv_shape, output_hours=OUTPUT_HOURS,
     -------
     model : keras.Model
     """
+    if output_hours is None:
+        output_hours = OUTPUT_HOURS        # read live global
+    if steps_per_hour is None:
+        steps_per_hour = STEPS_PER_HOUR   # read live global
+
     # --- Three inputs ---
     encoder_input = Input(shape=input_shape, name='encoder_input')
     stat_input    = Input(shape=stat_shape,  name='stat_input')
@@ -638,10 +647,11 @@ def plot_evaluation(y_test, y_pred, fc_test, ts_test, history):
     Create evaluation plots comparing CNN-LSTM vs External Forecast.
 
     Plots:
-      1. 48h forecast: 3 curves (Actual, CNN-LSTM, External)
+      1. Forecast curves (Actual, CNN-LSTM, External) for the full horizon
       2. KPI bar chart comparison (RMSE, MAE, MAPE)
       3. Training history (loss curves)
       4. Actual vs Predicted scatter plot
+      5. (96h only) Per-day KPI breakdown: Day+1, Day+2, Day+3, Day+4
     """
     # --- Compute KPIs across ALL test samples ---
     cnn_metrics = compute_metrics(y_test, y_pred)
@@ -683,7 +693,7 @@ def plot_evaluation(y_test, y_pred, fc_test, ts_test, history):
     if ext_plot_valid.any():
         ax1.plot(x[ext_plot_valid], external[ext_plot_valid], 'g-.',
                  label='External Forecast', linewidth=1.2)
-    ax1.set_title(f'48h Forecast from {pd.Timestamp(ts_test[sample_idx]).strftime("%Y-%m-%d %H:%M")}',
+    ax1.set_title(f'{OUTPUT_HOURS}h Forecast from {pd.Timestamp(ts_test[sample_idx]).strftime("%Y-%m-%d %H:%M")}',
                   fontsize=13, fontweight='bold')
     ax1.set_xlabel('Time step (5-min intervals)')
     ax1.set_ylabel('Load (kW)')
@@ -750,6 +760,66 @@ def plot_evaluation(y_test, y_pred, fc_test, ts_test, history):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
     print(f"\nResults plot saved to: {save_path}")
+
+    # --- Extra per-day KPI breakdown (only for horizons longer than 48h) ---
+    if OUTPUT_HOURS > 48:
+        n_days = OUTPUT_HOURS // 24
+        steps_per_day = 24 * STEPS_PER_HOUR
+        day_labels = [f'Day +{d+1}' for d in range(n_days)]
+
+        rmse_cnn, mae_cnn, mape_cnn = [], [], []
+        rmse_ext, mae_ext, mape_ext = [], [], []
+
+        for d in range(n_days):
+            s = d * steps_per_day
+            e = s + steps_per_day
+            yt_d = y_test[:, s:e].flatten()
+            yp_d = y_pred[:, s:e].flatten()
+            m_cnn = compute_metrics(yt_d, yp_d)
+            rmse_cnn.append(m_cnn['rmse'])
+            mae_cnn.append(m_cnn['mae'])
+            mape_cnn.append(m_cnn['mape'])
+
+            fc_d = fc_test[:, s:e].flatten()
+            valid = np.isfinite(fc_d) & (fc_d > 0) & np.isfinite(yt_d) & (yt_d > 0)
+            if valid.any():
+                m_ext = compute_metrics(yt_d[valid], fc_d[valid])
+            else:
+                m_ext = {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+            rmse_ext.append(m_ext['rmse'])
+            mae_ext.append(m_ext['mae'])
+            mape_ext.append(m_ext['mape'])
+
+        fig2, axes2 = plt.subplots(1, 3, figsize=(16, 5))
+        x_pos = np.arange(n_days)
+        width = 0.35
+        titles = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+        cnn_series = [rmse_cnn, mae_cnn, mape_cnn]
+        ext_series = [rmse_ext, mae_ext, mape_ext]
+
+        for ax, title, cnn_vals, ext_vals in zip(axes2, titles, cnn_series, ext_series):
+            bars_c = ax.bar(x_pos - width / 2, cnn_vals, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+            bars_e = ax.bar(x_pos + width / 2, ext_vals, width,
+                            label='External', color='coral', edgecolor='black', alpha=0.8)
+            for bars in [bars_c, bars_e]:
+                for bar in bars:
+                    h = bar.get_height()
+                    if np.isfinite(h):
+                        ax.text(bar.get_x() + bar.get_width() / 2, h,
+                                f'{h:.1f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(day_labels, fontsize=11)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+
+        fig2.suptitle(f'{OUTPUT_HOURS}h Forecast — KPI per Day', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        save_path2 = os.path.join(RESULTS_DIR, f'CNN_LSTM_Results_{OUTPUT_HOURS}h_PerDay.png')
+        plt.savefig(save_path2, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Per-day KPI plot saved to: {save_path2}")
 
 
 # =============================================================================
@@ -861,7 +931,9 @@ def run_train():
     # 2b. Build statistical profiles for decoder conditioning (Input 2)
     print("\n--- Step 2b: Building Statistical Profiles ---")
     load_values = df['Load_Is'].values.astype(np.float32)
-    stat_profiles = build_stat_profiles(load_values, start_indices)
+    stat_profiles = build_stat_profiles(load_values, start_indices,
+                                        horizon=FORECAST_HORIZON,
+                                        n_weeks=STAT_N_WEEKS)
     print(f"  Stat profiles shape: {stat_profiles.shape}  "
           f"(samples, horizon, {STAT_N_WEEKS} weeks)")
 
@@ -1111,7 +1183,7 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
     ext_valid = np.isfinite(external_load) & (external_load > 0)
 
     # Compute metrics on LAST 24h only (fair comparison: external forecasts 1 day ahead)
-    KPI_START = 288  # step 288 = +24h mark
+    KPI_START = 24 * STEPS_PER_HOUR  # step = +24h mark
     cnn_m = None
     stat_m = None
     ext_m = None
@@ -1257,18 +1329,22 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='CNN-LSTM 48h Load Prediction',
+        description='CNN-LSTM load forecast (48h or 96h)',
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""Examples:
   python CNN_LSTM_Prediction.py --train
+  python CNN_LSTM_Prediction.py --train --hours 96
   python CNN_LSTM_Prediction.py --predict 2026-02-15
-  python CNN_LSTM_Prediction.py --predict "2026-02-15 08:00"
+  python CNN_LSTM_Prediction.py --predict 2026-02-15 --hours 96
   python CNN_LSTM_Prediction.py --predict 2026-02-15 --n-weeks 6 --agg-method median
 """)
     parser.add_argument('--train', action='store_true',
                         help='Train the model on historical data')
     parser.add_argument('--predict', type=str, metavar='DATE',
-                        help='Predict 48h from DATE (format: YYYY-MM-DD)')
+                        help='Run forecast from DATE (format: YYYY-MM-DD)')
+    parser.add_argument('--hours', type=int, default=OUTPUT_HOURS,
+                        help=f'Forecast horizon in hours (default: {OUTPUT_HOURS}). '
+                             f'Use 48 for Mon-Thu, 96 for Fri-Sun.')
     parser.add_argument('--n-weeks', type=int, default=HYBRID_N_PAST_WEEKS,
                         help=f'Same-weekday weeks to look back (default: {HYBRID_N_PAST_WEEKS})')
     parser.add_argument('--agg-method', type=str, default=HYBRID_AGG_METHOD,
@@ -1276,6 +1352,22 @@ if __name__ == "__main__":
                         help=f'Statistical aggregation method (default: {HYBRID_AGG_METHOD})')
 
     args = parser.parse_args()
+
+    # Override globals when --hours is given
+    if args.hours != OUTPUT_HOURS:
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod.OUTPUT_HOURS     = args.hours
+        _mod.FORECAST_HORIZON = args.hours * STEPS_PER_HOUR
+        _mod.MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{args.hours}h.keras')
+        _mod.CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{args.hours}h.npz')
+        # Update module-level names for functions that read them at call time
+        OUTPUT_HOURS     = _mod.OUTPUT_HOURS
+        FORECAST_HORIZON = _mod.FORECAST_HORIZON
+        MODEL_PATH       = _mod.MODEL_PATH
+        CONFIG_PATH      = _mod.CONFIG_PATH
+        print(f"[--hours {args.hours}]  FORECAST_HORIZON={FORECAST_HORIZON}  "
+              f"MODEL_PATH={os.path.basename(MODEL_PATH)}")
 
     if args.train:
         run_train()
