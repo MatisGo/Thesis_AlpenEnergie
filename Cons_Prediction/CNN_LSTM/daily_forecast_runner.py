@@ -41,7 +41,10 @@ SENDER_APP_PASSWORD = "hkjk hszi rcqr vmge"         # Gmail App Password (16 cha
 RECIPIENT_EMAILS    = ["matis.gourdes@proton.me"] #, "timothee.devarax@gmail.com"]     # List — add more if needed
 
 # --- Prediction --------------------------------------------------------------
-PREDICT_DATE_OFFSET = 0     # 0 = today at 00:00,  1 = tomorrow, etc.
+PREDICT_DATE_OFFSET    = 0     # 0 = today at 00:00,  1 = tomorrow, etc.
+RUN_ON_WEEKEND         = False # If False, script exits immediately on Saturday and Sunday
+DEFAULT_FORECAST_HOURS = 48   # Mon–Thu forecast horizon
+FRIDAY_FORECAST_HOURS  = 96   # Fri–Sun forecast horizon (covers the full weekend)
 
 # --- SMTP (Gmail — no change needed) ----------------------------------------
 SMTP_HOST = "smtp.gmail.com"
@@ -87,15 +90,16 @@ def _smtp_connect():
     return server
 
 
-def send_success_email(csv_path: str, predict_date: str, duration_s: float):
+def send_success_email(csv_path: str, predict_date: str, duration_s: float,
+                       hours: int = DEFAULT_FORECAST_HOURS):
     """Send forecast CSV as attachment to all recipients."""
-    subject = f"[AlpenEnergie / Master Thesis] 48h Load Forecast — {predict_date}"
+    subject = f"[AlpenEnergie / Master Thesis] {hours}h Load Forecast — {predict_date}"
     body = (
         f"Hello,\n\n"
-        f"Here is the daily 48h load forecast for {predict_date} "
-        f"in {duration_s:.0f} seconds.\n\n"
+        f"Here is the daily {hours}h load forecast for {predict_date} "
+        f"completed in {duration_s:.0f} seconds.\n\n"
         f"The forecast CSV is attached.\n\n"
-        f"Best Regards, \nMatis Gourdes\n\n AlpenEnergie Automated Forecast"
+        f"Best Regards, \nMatis Gourdes\n\nAlpenEnergie Automated Forecast"
     )
 
     msg = MIMEMultipart()
@@ -163,14 +167,14 @@ def run_weather_update():
     log.info("  Weather update complete.")
 
 
-def run_prediction(predict_date: str) -> str:
+def run_prediction(predict_date: str, hours: int) -> str:
     """
     Step 2 — Run CNN-LSTM forecast for predict_date (YYYY-MM-DD).
     Returns the path to the generated CSV file.
     """
-    log.info(f"Step 2/2 — Running CNN-LSTM forecast for {predict_date} ...")
+    log.info(f"Step 2/2 — Running CNN-LSTM {hours}h forecast for {predict_date} ...")
     result = subprocess.run(
-        [PYTHON, PREDICT_SCRIPT, "--predict", predict_date],
+        [PYTHON, PREDICT_SCRIPT, "--predict", predict_date, "--hours", str(hours)],
         capture_output=True,
         text=True,
     )
@@ -190,14 +194,25 @@ def run_prediction(predict_date: str) -> str:
 # =============================================================================
 
 def main():
+    today = datetime.date.today()
+
+    # Weekend guard — Saturday=5, Sunday=6
+    if not RUN_ON_WEEKEND and today.weekday() >= 5:
+        log.info(f"  Skipping — today is {today.strftime('%A')} and RUN_ON_WEEKEND=False.")
+        return
+
     predict_date = (
-        datetime.date.today() + datetime.timedelta(days=PREDICT_DATE_OFFSET)
+        today + datetime.timedelta(days=PREDICT_DATE_OFFSET)
     ).strftime("%Y-%m-%d")
+
+    # Friday (weekday=4) triggers the 96h weekend forecast; all other days use 48h
+    forecast_hours = FRIDAY_FORECAST_HOURS if today.weekday() == 4 else DEFAULT_FORECAST_HOURS
 
     log.info("=" * 60)
     log.info("  AlpenEnergie Daily Forecast Runner")
-    log.info(f"  Predict date : {predict_date}")
-    log.info(f"  Started at   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"  Predict date   : {predict_date}")
+    log.info(f"  Forecast hours : {forecast_hours}h")
+    log.info(f"  Started at     : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 60)
 
     start_time = datetime.datetime.now()
@@ -213,7 +228,7 @@ def main():
 
     # Step 2 — Forecast
     try:
-        csv_path = run_prediction(predict_date)
+        csv_path = run_prediction(predict_date, forecast_hours)
     except Exception:
         details = traceback.format_exc()
         log.error(f"Forecast failed:\n{details}")
@@ -223,7 +238,7 @@ def main():
     # Step 3 — Send result email
     duration = (datetime.datetime.now() - start_time).total_seconds()
     try:
-        send_success_email(csv_path, predict_date, duration)
+        send_success_email(csv_path, predict_date, duration, forecast_hours)
     except Exception:
         details = traceback.format_exc()
         log.error(f"Email sending failed:\n{details}")
