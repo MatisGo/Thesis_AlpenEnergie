@@ -105,7 +105,7 @@ INPUT_FEATURES = [
     'PHolyday',             # Public holiday flag (0/1)
     'Temp_Forecast',        # Temperature forecast (deg C)
     'Rain_Forecast',        # Rain forecast (mm)
-    'Irr_FC',               # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
+    'Irr_FC',                # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
     'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
 ]
 TARGET = 'Load_Is'
@@ -1240,7 +1240,7 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
                  external_load[ext_valid[:len(external_load)]],
                  'g-.', label='External Forecast', linewidth=1.5)
 
-    ax1.set_title(f'48h Load Prediction from {date_str}', fontsize=14, fontweight='bold')
+    ax1.set_title(f'{OUTPUT_HOURS}h Load Prediction from {date_str}', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Load (kW)', fontsize=12)
     ax1.legend(fontsize=9, loc='upper right')
     ax1.grid(True, alpha=0.3)
@@ -1304,23 +1304,135 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
     else:
         print("\nNo actual load data available for this period (future prediction).")
 
+    # 10b. Per-day KPI breakdown (only when horizon > 48h and actual data is present)
+    if OUTPUT_HOURS > 48 and has_actual:
+        steps_per_day = 24 * STEPS_PER_HOUR
+        n_days = OUTPUT_HOURS // 24
+        print(f"\n--- Per-Day KPI Breakdown ({OUTPUT_HOURS}h forecast) ---")
+        print(f"{'Day':<10} {'CNN RMSE':>10} {'CNN MAE':>10} {'CNN MAPE':>10} "
+              f"{'Stat RMSE':>10} {'Stat MAE':>10} {'Stat MAPE':>10}")
+        print("-" * 72)
+
+        day_labels, day_cnn, day_stat, day_ext = [], [], [], []
+        for d in range(n_days):
+            s = d * steps_per_day
+            e = s + steps_per_day
+            label = (start_time + pd.Timedelta(hours=24 * d)).strftime('%a %d.%m')
+            day_labels.append(f'Day+{d+1}\n{label}')
+
+            act_d = actual_load[s:e] if len(actual_load) >= e else actual_load[s:]
+            if len(act_d) == 0 or not np.isfinite(act_d).any():
+                print(f"  Day+{d+1} ({label}): no actual data")
+                day_cnn.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                day_stat.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                day_ext.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                continue
+
+            pred_d = y_pred[s:s + len(act_d)]
+            stat_d = stat_values[s:s + len(act_d)]
+            m_cnn  = compute_metrics(act_d, pred_d)
+            m_stat = compute_metrics(act_d, stat_d)
+            day_cnn.append(m_cnn)
+            day_stat.append(m_stat)
+
+            ext_d = external_load[s:e] if len(external_load) >= e else external_load[s:]
+            ext_d = ext_d[:len(act_d)]
+            ext_valid_d = np.isfinite(ext_d) & (ext_d > 0)
+            if ext_valid_d.any():
+                m_ext = compute_metrics(act_d[ext_valid_d], ext_d[ext_valid_d])
+            else:
+                m_ext = {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+            day_ext.append(m_ext)
+
+            print(f"  Day+{d+1} ({label}) | "
+                  f"CNN: {m_cnn['rmse']:6.1f} kW / {m_cnn['mae']:6.1f} kW / {m_cnn['mape']:5.1f}%  |  "
+                  f"Stat: {m_stat['rmse']:6.1f} kW / {m_stat['mae']:6.1f} kW / {m_stat['mape']:5.1f}%")
+
+        # Per-day KPI bar chart
+        fig_d, axes_d = plt.subplots(1, 3, figsize=(16, 5))
+        x_pos = np.arange(n_days)
+        width = 0.25
+        titles = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+        keys   = ['rmse', 'mae', 'mape']
+
+        for ax, title, key in zip(axes_d, titles, keys):
+            cnn_v  = [d[key] for d in day_cnn]
+            stat_v = [d[key] for d in day_stat]
+            ext_v  = [d[key] for d in day_ext]
+            has_ext = any(np.isfinite(v) for v in ext_v)
+
+            if has_ext:
+                bc = ax.bar(x_pos - width, cnn_v, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+                bs = ax.bar(x_pos,          stat_v, width,
+                            label='Statistical', color='cyan', edgecolor='black', alpha=0.8)
+                be = ax.bar(x_pos + width,  ext_v, width,
+                            label='External', color='coral', edgecolor='black', alpha=0.8)
+                all_b = [bc, bs, be]
+            else:
+                bc = ax.bar(x_pos - width / 2, cnn_v, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+                bs = ax.bar(x_pos + width / 2, stat_v, width,
+                            label='Statistical', color='cyan', edgecolor='black', alpha=0.8)
+                all_b = [bc, bs]
+
+            for bars in all_b:
+                for bar in bars:
+                    h = bar.get_height()
+                    if np.isfinite(h):
+                        ax.text(bar.get_x() + bar.get_width() / 2, h,
+                                f'{h:.1f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(day_labels, fontsize=9)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+
+        fig_d.suptitle(f'{OUTPUT_HOURS}h Prediction — KPI per Day  |  from {date_str}',
+                       fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        plot_day_path = os.path.join(RESULTS_DIR,
+                                     f'Prediction_{date_str.replace(":", "-")}_PerDay.png')
+        plt.savefig(plot_day_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Per-day KPI plot saved to: {plot_day_path}")
+
     # 11. Save predictions to CSV
+    # Build full 5-min DataFrame, then trim first 24h, then resample to 15-min (mean)
+    EXPORT_SKIP = 24 * STEPS_PER_HOUR   # drop first 24h (288 steps)
     pred_df = pd.DataFrame({
-        'DateTime': future_ts,
+        'DateTime':        future_ts,
         'CNN_LSTM_Load_kW': y_pred,
-        'Statistical_Load_kW': stat_values,
-        'PV_Est_kW': pv_slice,
+        'PV_Est_kW':        pv_slice,
     })
-    csv_path = os.path.join(RESULTS_DIR, f'Prediction_{date_str.replace(":", "-")}.csv')
+    # Drop first 24h
+    pred_df = pred_df.iloc[EXPORT_SKIP:].reset_index(drop=True)
+    # Resample to 15-min mean (3 consecutive 5-min steps → 1 value)
+    pred_df = (
+        pred_df.set_index('DateTime')
+               .resample('15min')
+               .mean()
+               .reset_index()
+    )
+    pred_df['CNN_LSTM_Load_kW'] = pred_df['CNN_LSTM_Load_kW'].round(1)
+    pred_df['PV_Est_kW']        = pred_df['PV_Est_kW'].round(1)
+
+    export_date_str = (pd.to_datetime(date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    csv_path = os.path.join(RESULTS_DIR, f'Prediction_{export_date_str}.csv')
     pred_df.to_csv(csv_path, index=False)
-    print(f"Predictions saved to: {csv_path}")
+    print(f"Predictions saved to: {csv_path}  "
+          f"({len(pred_df)} rows @ 15-min, starting +24h from {date_str})")
 
     # Summary
+    export_start = pred_df['DateTime'].iloc[0]
+    export_end   = pred_df['DateTime'].iloc[-1]
     print(f"\n--- Prediction Summary ---")
-    print(f"  Period: {future_ts[0]} to {future_ts[-1]}")
-    print(f"  CNN-LSTM  -> Mean: {y_pred.mean():.1f} kW, "
-          f"Min: {y_pred.min():.1f}, Max: {y_pred.max():.1f}")
-    print(f"  Stats     -> Mean: {np.nanmean(stat_values):.1f} kW")
+    print(f"  Full horizon : {future_ts[0]} to {future_ts[-1]}")
+    print(f"  Exported     : {export_start} to {export_end}  ({len(pred_df)} rows @ 15-min)")
+    print(f"  CNN-LSTM  -> Mean: {pred_df['CNN_LSTM_Load_kW'].mean():.1f} kW, "
+          f"Min: {pred_df['CNN_LSTM_Load_kW'].min():.1f}, "
+          f"Max: {pred_df['CNN_LSTM_Load_kW'].max():.1f}")
 
 
 # =============================================================================

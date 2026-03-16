@@ -36,13 +36,13 @@ from email                import encoders
 # =============================================================================
 
 # --- Email -------------------------------------------------------------------
-SENDER_EMAIL        = "matisgo.74@gmail.com"       # Gmail used to send
-SENDER_APP_PASSWORD = "hkjk hszi rcqr vmge"         # Gmail App Password (16 chars)
-RECIPIENT_EMAILS    = ["matis.gourdes@proton.me"] #, "timothee.devarax@gmail.com"]     # List — add more if needed
+SENDER_EMAIL        = "forecast.alpenenergie@gmail.com"       # Gmail used to send
+SENDER_APP_PASSWORD = "zdqt aucw wvwv hmhr"         # Gmail App Password (16 chars)
+RECIPIENT_EMAILS    = ["matis.gourdes@proton.me","D.Watson@alpenenergie.ch"] #, "timothee.devarax@gmail.com"]     # List — add more if needed
 
 # --- Prediction --------------------------------------------------------------
 PREDICT_DATE_OFFSET    = 0     # 0 = today at 00:00,  1 = tomorrow, etc.
-RUN_ON_WEEKEND         = False # If False, script exits immediately on Saturday and Sunday
+RUN_ON_WEEKEND         = True # If False, script exits immediately on Saturday and Sunday
 DEFAULT_FORECAST_HOURS = 48   # Mon–Thu forecast horizon
 FRIDAY_FORECAST_HOURS  = 96   # Fri–Sun forecast horizon (covers the full weekend)
 
@@ -96,8 +96,7 @@ def send_success_email(csv_path: str, predict_date: str, duration_s: float,
     subject = f"[AlpenEnergie / Master Thesis] {hours}h Load Forecast — {predict_date}"
     body = (
         f"Hello,\n\n"
-        f"Here is the daily {hours}h load forecast for {predict_date} "
-        f"completed in {duration_s:.0f} seconds.\n\n"
+        f"Here is the daily {hours}h load forecast for {predict_date}. "
         f"The forecast CSV is attached.\n\n"
         f"Best Regards, \nMatis Gourdes\n\nAlpenEnergie Automated Forecast"
     )
@@ -182,7 +181,9 @@ def run_prediction(predict_date: str, hours: int) -> str:
         raise RuntimeError(result.stderr or result.stdout)
     log.info("  Forecast complete.")
 
-    csv_filename = f"Prediction_{predict_date}.csv"
+    import datetime as _dt
+    export_date = (_dt.date.fromisoformat(predict_date) + _dt.timedelta(days=1)).isoformat()
+    csv_filename = f"Prediction_{export_date}.csv"
     csv_path = os.path.join(RESULTS_DIR, csv_filename)
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"Expected CSV not found: {csv_path}")
