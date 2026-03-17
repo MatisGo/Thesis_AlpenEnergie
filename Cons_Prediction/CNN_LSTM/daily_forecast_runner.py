@@ -54,7 +54,7 @@ SMTP_PORT = 587
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 WEATHER_SCRIPT = os.path.join(SCRIPT_DIR, "get_weather_data.py")
 PREDICT_SCRIPT = os.path.join(SCRIPT_DIR, "CNN_LSTM_Prediction.py")
-RESULTS_DIR    = os.path.join(SCRIPT_DIR, "Simulation results")
+RESULTS_DIR    = os.path.join(SCRIPT_DIR, "..", "Output Forecast")
 LOG_FILE       = os.path.join(SCRIPT_DIR, "daily_runner.log")
 
 # --- Python interpreter (same environment as this script) -------------------

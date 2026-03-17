@@ -69,7 +69,7 @@ import matplotlib.colors as mcolors
 # CONFIGURATION
 # =============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))        # .../PV_Correction/
-PV_FILE    = os.path.join(SCRIPT_DIR, '..', '..', 'PV_Production_Forecast_23_24.xlsx')
+PV_FILE    = os.path.join(SCRIPT_DIR, '..', 'Ressource', 'PV_Production_Forecast_23_24.xlsx')
 OUT_NPZ    = os.path.join(SCRIPT_DIR, 'PV_Correction_Table.npz')
 OUT_CSV    = os.path.join(SCRIPT_DIR, 'PV_Correction_Table.csv')
 OUT_PLOT   = os.path.join(SCRIPT_DIR, 'PV_Correction_Table_Analysis.png')

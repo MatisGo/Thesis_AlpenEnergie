@@ -1,0 +1,57 @@
+============================================================
+  AlpenEnergie — Load Forecast Setup Guide
+============================================================
+
+REQUIREMENTS
+------------
+- Windows 10 or 11
+- Python 3.10, 3.11, or 3.12  (https://www.python.org/downloads/)
+  Check "Add Python to PATH" during installation!
+
+
+FIRST-TIME SETUP (run once)
+----------------------------
+1. Open a terminal (Win + R → type "cmd" → Enter)
+
+2. Install required packages:
+
+   pip install tensorflow pandas openpyxl requests scipy numpy matplotlib scikit-learn
+
+3. That's it.
+
+
+HOW TO RUN THE DAILY FORECAST
+-------------------------------
+1. Drop the latest SCADA export (.csv) into:
+      Cons_Prediction\Input\
+
+2. Double-click:
+      Cons_Prediction\Run_Forecast.bat
+
+3. Find the result in:
+      Cons_Prediction\Output Forecast\Prediction_YYYY-MM-DD.csv
+
+Log file (for troubleshooting):
+      Cons_Prediction\CNN_LSTM\main_runner.log
+
+
+FOLDER STRUCTURE
+-----------------
+Cons_Prediction\
+  Run_Forecast.bat          <- double-click to run
+  SETUP.txt                 <- this file
+  Input\                    <- put SCADA CSV exports here
+  Output Forecast\          <- forecast results appear here
+  CNN_LSTM\
+    main.py                 <- pipeline controller
+    Ressource\              <- Excel data files (do not move)
+    Model\                  <- trained model files (do not move)
+
+
+NOTES
+------
+- The forecast runs for 48h Mon-Thu and 96h on Fridays automatically.
+- Internet connection is required (weather data from Open-Meteo API).
+- If the script fails, check main_runner.log for the error details.
+
+============================================================

@@ -71,9 +71,9 @@ from tensorflow.keras.losses import Huber
 # CONFIGURATION
 # =============================================================================
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR   = os.path.join(SCRIPT_DIR, 'Simulation results')
-DATA_PATH     = os.path.join(SCRIPT_DIR, '..', 'Data_Prediction.xlsx')
-WEATHER_PATH  = os.path.join(SCRIPT_DIR, 'Imported_Forecast.xlsx')
+RESULTS_DIR   = os.path.join(SCRIPT_DIR, '..', 'Output Forecast')
+DATA_PATH     = os.path.join(SCRIPT_DIR, 'Ressource', 'Data_Prediction.xlsx')
+WEATHER_PATH  = os.path.join(SCRIPT_DIR, 'Ressource', 'Imported_Forecast.xlsx')
 PV_TABLE_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_Correction_Table.npz')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -1433,6 +1433,29 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
     print(f"  CNN-LSTM  -> Mean: {pred_df['CNN_LSTM_Load_kW'].mean():.1f} kW, "
           f"Min: {pred_df['CNN_LSTM_Load_kW'].min():.1f}, "
           f"Max: {pred_df['CNN_LSTM_Load_kW'].max():.1f}")
+
+
+# =============================================================================
+# PUBLIC API — call this from main.py or any other script
+# =============================================================================
+
+def run_forecast(predict_date: str, hours: int = OUTPUT_HOURS,
+                 n_weeks: int = HYBRID_N_PAST_WEEKS,
+                 agg_method: str = HYBRID_AGG_METHOD):
+    """
+    Run a forecast programmatically without argparse.
+    predict_date : 'YYYY-MM-DD'
+    hours        : 48 or 96
+    """
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    _mod.OUTPUT_HOURS     = hours
+    _mod.FORECAST_HORIZON = hours * STEPS_PER_HOUR
+    _mod.MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{hours}h.keras')
+    _mod.CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{hours}h.npz')
+    print(f"[run_forecast]  hours={hours}  FORECAST_HORIZON={hours * STEPS_PER_HOUR}  "
+          f"MODEL={os.path.basename(_mod.MODEL_PATH)}")
+    run_predict(predict_date, n_weeks=n_weeks, agg_method=agg_method)
 
 
 # =============================================================================

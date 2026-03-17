@@ -43,7 +43,7 @@ FORECAST_END = datetime.datetime.combine(TODAY + datetime.timedelta(days=4),
                                          datetime.time(0, 0, 0))  # midnight of day+4
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, "Imported_Forecast.xlsx")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "Ressource", "Imported_Forecast.xlsx")
 
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
