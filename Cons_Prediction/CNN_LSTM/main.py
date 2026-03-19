@@ -106,8 +106,8 @@ def main():
         log.error(f"Step 2 failed:\n{traceback.format_exc()}")
         sys.exit(1)
 
-    # Step 3 — Forecast
-    log.info(f"Step 3/3 — CNN-LSTM {forecast_hours}h forecast ...")
+    # Step 3 — Load forecast
+    log.info(f"Step 3/4 — CNN-LSTM {forecast_hours}h forecast ...")
     try:
         import CNN_LSTM_Prediction
         CNN_LSTM_Prediction.run_forecast(predict_date, hours=forecast_hours)
@@ -117,6 +117,36 @@ def main():
     except Exception:
         log.error(f"Step 3 failed:\n{traceback.format_exc()}")
         sys.exit(1)
+
+    # Step 4 — Production forecast (DNN) → write to new sheet in output Excel
+    log.info("Step 4/4 — DNN production forecast ...")
+    try:
+        import DNN_Prod_Prediction
+        prod_value, prod_date = DNN_Prod_Prediction.run_predict(show_plots=False)
+
+        if prod_value is not None:
+            import pandas as pd
+
+            # Convert output CSV to Excel if needed, then add Prod Prediction sheet
+            xlsx_path = output_path.replace('.csv', '.xlsx')
+            df_load = pd.read_csv(output_path)
+
+            with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+                df_load.to_excel(writer, sheet_name='Load Forecast', index=False)
+                df_prod = pd.DataFrame({
+                    'Date':                   [str(prod_date.date())],
+                    'Predicted_Avg_Prod_kW':  [round(float(prod_value), 1)],
+                })
+                df_prod.to_excel(writer, sheet_name='Prod Prediction', index=False)
+
+            log.info(f"  Production forecast: {prod_value:,.1f} kW avg for {prod_date.date()}")
+            log.info(f"  Output (Excel): {xlsx_path}")
+        else:
+            log.warning("  Production forecast skipped (no model or weather data).")
+        log.info("  Step 4 — done.")
+    except Exception:
+        log.error(f"Step 4 failed:\n{traceback.format_exc()}")
+        # Non-critical — do not exit
 
     duration = (datetime.datetime.now() - start).total_seconds()
     log.info("=" * 60)

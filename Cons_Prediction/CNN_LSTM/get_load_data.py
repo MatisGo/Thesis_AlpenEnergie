@@ -100,8 +100,8 @@ def extend_calendar(ws, holidays: set, end_dt: datetime.datetime):
     while current <= end_dt:
         d = current.date()
         ws.cell(row=next_row, column=1).value = current.strftime('%d.%m.%Y %H:%M:%S')
-        ws.cell(row=next_row, column=2).value = current.strftime('%Y-%m-%d 00:00:00')
-        ws.cell(row=next_row, column=3).value = current.strftime('%H:%M:%S')
+        ws.cell(row=next_row, column=2).value = datetime.datetime(d.year, d.month, d.day)
+        ws.cell(row=next_row, column=3).value = current.time()
         ws.cell(row=next_row, column=4).value = d.isoweekday()         # Mon=1 … Sun=7
         ws.cell(row=next_row, column=5).value = 1 if d in holidays else 0
         next_row += 1
@@ -165,8 +165,8 @@ def import_csv(csv_path: str, ws, ts_index: dict, signal_index: dict):
         print(f"    SKIP — no matching signals found.")
         return
 
-    written = 0
-    skipped = 0
+    # Parse all data rows into a list of (datetime, {col_idx: float})
+    raw_rows = []
     for line in lines[2:]:
         line = line.rstrip(';\n')
         if not line:
@@ -174,32 +174,72 @@ def import_csv(csv_path: str, ws, ts_index: dict, signal_index: dict):
         parts = line.split(';')
         if len(parts) < 2:
             continue
-
-        raw_ts = parts[0].strip()
-
-        # Normalise timestamp: parse and reformat to guarantee canonical form.
-        # This also catches any subtle format differences.
         try:
-            ts_dt = datetime.datetime.strptime(raw_ts, '%d.%m.%Y %H:%M:%S')
-            ts_key = ts_dt.strftime('%d.%m.%Y %H:%M:%S')
+            ts_dt = datetime.datetime.strptime(parts[0].strip(), '%d.%m.%Y %H:%M:%S')
         except ValueError:
-            skipped += 1
             continue
-
-        excel_row = ts_index.get(ts_key)
-        if excel_row is None:
-            skipped += 1
-            continue
-
+        vals = {}
         for i, excel_col in col_map.items():
             raw_val = parts[i + 1].strip() if (i + 1) < len(parts) else ''
             if raw_val == '':
                 continue
             try:
-                ws.cell(row=excel_row, column=excel_col).value = float(raw_val.replace(',', '.'))
+                vals[i] = float(raw_val.replace(',', '.'))
             except ValueError:
-                ws.cell(row=excel_row, column=excel_col).value = raw_val
+                vals[i] = raw_val
+        raw_rows.append((ts_dt, vals))
 
+    if not raw_rows:
+        print(f"    SKIP — no valid data rows found.")
+        return
+
+    # Detect resolution: gap between first two timestamps
+    if len(raw_rows) >= 2:
+        gap_minutes = int((raw_rows[1][0] - raw_rows[0][0]).total_seconds() / 60)
+    else:
+        gap_minutes = STEP_MINUTES
+
+    # Interpolate to 5-min if resolution is coarser (e.g. 15-min)
+    if gap_minutes > STEP_MINUTES:
+        print(f"    Detected {gap_minutes}-min resolution — interpolating to {STEP_MINUTES}-min ...")
+        interp_rows = []
+        for k in range(len(raw_rows) - 1):
+            t0, v0 = raw_rows[k]
+            _,  v1 = raw_rows[k + 1]
+            steps = gap_minutes // STEP_MINUTES
+            for s in range(steps):
+                frac = s / steps
+                ts_interp = t0 + datetime.timedelta(minutes=s * STEP_MINUTES)
+                vals_interp = {}
+                for i, excel_col in col_map.items():
+                    a = v0.get(i)
+                    b = v1.get(i)
+                    # Cols O-R (15-18) are status flags — forward-fill, no interpolation
+                    if excel_col in (15, 16, 17, 18):
+                        if a is not None:
+                            vals_interp[i] = a
+                    elif isinstance(a, float) and isinstance(b, float):
+                        vals_interp[i] = round(a + frac * (b - a), 3)
+                    elif a is not None:
+                        vals_interp[i] = a
+                interp_rows.append((ts_interp, vals_interp))
+        # Append the last original row
+        interp_rows.append(raw_rows[-1])
+        raw_rows = interp_rows
+
+    # Write to Excel
+    written = 0
+    skipped = 0
+    for ts_dt, vals in raw_rows:
+        ts_key    = ts_dt.strftime('%d.%m.%Y %H:%M:%S')
+        excel_row = ts_index.get(ts_key)
+        if excel_row is None:
+            skipped += 1
+            continue
+        for i, excel_col in col_map.items():
+            v = vals.get(i)
+            if v is not None:
+                ws.cell(row=excel_row, column=excel_col).value = v
         written += 1
 
     print(f"    Written: {written} rows  |  Skipped (no match): {skipped} rows")

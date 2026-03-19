@@ -1,5 +1,7 @@
 # Thesis_AlpenEnergie
 
+Python Version 3.12
+
 Cons_Prediction Folder is the Load Forecast Code predicting the 48 next hours electricity consumption in the municipality
 
 Command for the CNN_LSTM Programm:

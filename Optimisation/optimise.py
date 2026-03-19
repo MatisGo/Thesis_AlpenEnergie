@@ -81,16 +81,38 @@ BIDMI_KWH_PER_MM     = 3.33
 HASELHOLZ_KWH_PER_MM = 0.455
 TIMESTEP_HOURS       = 5 / 60
 
+# Water discharged per kW of each turbine's own production per timestep (mm/kW)
+COEFF_B_PER_KW = TIMESTEP_HOURS / BIDMI_KWH_PER_MM        # 0.02502 mm / kW
+COEFF_H_PER_KW = TIMESTEP_HOURS / HASELHOLZ_KWH_PER_MM    # 0.18315 mm / kW
+
+# Nominal fractions (used only for output labelling and reference)
 _DENOM  = 1.0 + TURBINE_RATIO
 FRAC_B  = 1.0 / _DENOM
 FRAC_H  = TURBINE_RATIO / _DENOM
 
-COEFF_B = FRAC_B * TIMESTEP_HOURS / BIDMI_KWH_PER_MM
-COEFF_H = FRAC_H * TIMESTEP_HOURS / HASELHOLZ_KWH_PER_MM
-
 P_MAX_COMBINED    = 2856.0
 P_MAX_BIDMI       = 1700.0
 P_MAX_HASELHOLZ   = 1156.0
+
+# ---------------------------------------------------------------------------
+# TURBINE RATIO FLEXIBILITY
+# ---------------------------------------------------------------------------
+# Haselholz "follows" Bidmi but is allowed to deviate ±RATIO_FLEX from the
+# nominal ratio of 1.560.  This lets the optimizer drain or protect Haselholz
+# independently without being forced to move Bidmi by the same proportion.
+#
+# Constraint (linear — LP compatible):
+#   (1 - RATIO_FLEX) * TURBINE_RATIO * P_B  <=  P_H  <=  (1 + RATIO_FLEX) * TURBINE_RATIO * P_B
+#
+# NOTE: when P_B = 0 the bounds collapse to P_H = 0 as well (plant fully off).
+#
+# Caveat: Natural_Inflow_H in results.csv was derived assuming the historical
+# fixed ratio.  At ±10% flexibility the discharge error is ±10% of the
+# turbine discharge term — small relative to natural inflow uncertainty.
+#
+RATIO_FLEX = 0.10              # ±10 % around nominal ratio
+RATIO_LO   = (1 - RATIO_FLEX) * TURBINE_RATIO   # 1.404
+RATIO_HI   = (1 + RATIO_FLEX) * TURBINE_RATIO   # 1.716
 
 RAMP_MAX = 500.0
 
@@ -206,8 +228,18 @@ def build_model(N, demand, price, nat_inflow_b, nat_inflow_h,
     m.T     = Set(initialize=T)
     m.T_ext = Set(initialize=T_ext)
 
-    # --- Decision variable ---
-    m.P = Var(m.T, domain=NonNegativeReals, bounds=(0.0, P_MAX_COMBINED))
+    # --- Decision variables: separate production per turbine ---
+    # P_B and P_H are bounded by each turbine's rated maximum.
+    # The ratio flexibility constraint (below) keeps them coupled near TURBINE_RATIO.
+    m.P_B = Var(m.T, domain=NonNegativeReals, bounds=(0.0, P_MAX_BIDMI))
+    m.P_H = Var(m.T, domain=NonNegativeReals, bounds=(0.0, P_MAX_HASELHOLZ))
+
+    # --- Ratio flexibility: P_H stays within ±RATIO_FLEX of nominal ratio ---
+    # Lower bound: P_H >= RATIO_LO * P_B  (Haselholz runs at least 90% of nominal share)
+    # Upper bound: P_H <= RATIO_HI * P_B  (Haselholz runs at most 110% of nominal share)
+    # Both collapse to P_H = 0 when P_B = 0 (plant fully off — correct behaviour).
+    m.ratio_lo = Constraint(m.T, rule=lambda m, t: m.P_H[t] >= RATIO_LO * m.P_B[t])
+    m.ratio_hi = Constraint(m.T, rule=lambda m, t: m.P_H[t] <= RATIO_HI * m.P_B[t])
 
     # --- Reservoir levels ---
     m.LB = Var(m.T_ext, bounds=(BIDMI_LEVEL_MIN, None))
@@ -229,31 +261,29 @@ def build_model(N, demand, price, nat_inflow_b, nat_inflow_h,
     m.spill_b = Var(m.T, domain=NonNegativeReals)
     m.spill_h = Var(m.T, domain=NonNegativeReals)
 
-    # --- Per-turbine rated maxima ---
-    m.prod_max_bidmi = Constraint(m.T, rule=lambda m, t: m.P[t] * FRAC_B <= P_MAX_BIDMI)
-    m.prod_max_hasel = Constraint(m.T, rule=lambda m, t: m.P[t] * FRAC_H <= P_MAX_HASELHOLZ)
-
-    # --- Ramp constraints ---
+    # --- Ramp constraints on combined production ---
     def ramp_up_rule(m, t):
         if t == 0: return Constraint.Skip
-        return m.P[t] - m.P[t-1] <= RAMP_MAX
+        return (m.P_B[t] + m.P_H[t]) - (m.P_B[t-1] + m.P_H[t-1]) <= RAMP_MAX
 
     def ramp_dn_rule(m, t):
         if t == 0: return Constraint.Skip
-        return m.P[t-1] - m.P[t] <= RAMP_MAX
+        return (m.P_B[t-1] + m.P_H[t-1]) - (m.P_B[t] + m.P_H[t]) <= RAMP_MAX
 
     m.ramp_up = Constraint(m.T, rule=ramp_up_rule)
     m.ramp_dn = Constraint(m.T, rule=ramp_dn_rule)
 
     # --- Water balance ---
-    NET_COEFF_H = COEFF_B - COEFF_H
-
+    # Bidmi: discharge = COEFF_B_PER_KW * P_B  (mm per kW of Bidmi production)
+    # Haselholz: receives 100% of Bidmi discharge as cascade input,
+    #            then discharges COEFF_H_PER_KW * P_H of its own
     m.wb_b = Constraint(m.T,
         rule=lambda m, t: m.LB[t+1] == m.LB[t] + nat_inflow_b[t]
-                          - COEFF_B * m.P[t] - m.spill_b[t])
+                          - COEFF_B_PER_KW * m.P_B[t] - m.spill_b[t])
     m.wb_h = Constraint(m.T,
         rule=lambda m, t: m.LH[t+1] == m.LH[t] + nat_inflow_h[t]
-                          + NET_COEFF_H * m.P[t] - m.spill_h[t])
+                          + COEFF_B_PER_KW * m.P_B[t]
+                          - COEFF_H_PER_KW * m.P_H[t] - m.spill_h[t])
 
     # --- Piecewise-linear terminal penalty ---
     # Bidmi: penalise |LB[N] - target_lb| beyond the free zone
@@ -284,7 +314,7 @@ def build_model(N, demand, price, nat_inflow_b, nat_inflow_h,
     # --- Objective ---
     m.obj = Objective(
         expr=(
-            sum((demand[t] - m.P[t]) * TIMESTEP_HOURS * price[t] / 1000.0
+            sum((demand[t] - m.P_B[t] - m.P_H[t]) * TIMESTEP_HOURS * price[t] / 1000.0
                 for t in m.T)
             + PW_SLOPE2 * (m.pw_b2 + m.pw_h2)
             + PW_SLOPE3 * (m.pw_b3 + m.pw_h3)
@@ -358,17 +388,19 @@ def optimise_day(day_df, solver, lb0=None, lh0=None, target_lb=None, target_lh=N
         day_df._opt_lh_end = lh0
         return day_df
 
-    opt_p  = [value(model.P[t]) for t in range(N)]
+    opt_pb = [value(model.P_B[t]) for t in range(N)]
+    opt_ph = [value(model.P_H[t]) for t in range(N)]
+    opt_p  = [opt_pb[t] + opt_ph[t] for t in range(N)]
     opt_lb = [value(model.LB[t]) for t in range(N)]
     opt_lh = [value(model.LH[t]) for t in range(N)]
 
-    # Terminal deviation is now relative to the seasonal target
+    # Terminal deviation relative to seasonal target
     dev_b = value(model.LB[N]) - target_lb
     dev_h = value(model.LH[N]) - target_lh
 
     day_df['Opt_Production_kW']             = opt_p
-    day_df['Opt_Bidmi_Production_kW']       = [p * FRAC_B for p in opt_p]
-    day_df['Opt_Haselholz_Production_kW']   = [p * FRAC_H for p in opt_p]
+    day_df['Opt_Bidmi_Production_kW']       = opt_pb
+    day_df['Opt_Haselholz_Production_kW']   = opt_ph
     day_df['Opt_Bidmi_mm']                  = opt_lb
     day_df['Opt_Haselholz_mm']              = opt_lh
     day_df['Opt_Network_Exchange_kW']       = [demand[t] - opt_p[t] for t in range(N)]
