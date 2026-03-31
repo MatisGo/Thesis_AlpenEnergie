@@ -5,11 +5,12 @@ Interactive daily dashboard for hydro optimisation results.
 
 Layout
 ------
-  [Controls 1] | [Graph 1] || [Controls 2] | [Graph 2]
-  ──────────────────────────────────────────────────────
-  [Date selector — bottom left]
+  [File selector + Controls 1] | [Graph 1] || [File selector + Controls 2] | [Graph 2]
+  ──────────────────────────────────────────────────────────────────────────────────────
+  [Date selector — bottom, shara ed across both graphs]
 
-Each graph has 4 curve slots.  Each curve gets its own Y-axis (colour-coded).
+Each panel loads its own results file independently.
+Each graph has 4 curve slots with colour-coded Y-axes.
 Reservoir-level columns automatically show Min/Max bounds in red.
 Y-axis range can be overridden per curve with the Min/Max inputs.
 
@@ -32,7 +33,7 @@ from matplotlib.lines import Line2D
 # Configuration
 # ---------------------------------------------------------------------------
 
-RESULTS_FILE = 'optimised_results.csv'
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Output')
 
 # Reservoir columns → automatic Min / Max horizontal lines in red
 LEVEL_BOUNDS = {
@@ -59,20 +60,30 @@ class DailyAnalysisApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Daily Analysis — AlpenEnergie")
-        self.root.geometry("1560x800")
-        self.root.minsize(960, 520)
-        self.df     = None
+        self.root.geometry("1560x820")
+        self.root.minsize(960, 540)
         self.panels = []
 
         self._build_ui()
-        self._load_data()
+        self._auto_load_panels()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _available_files(self):
+        """Return list of .xlsx filenames found in the Output directory."""
+        if not os.path.isdir(OUTPUT_DIR):
+            return []
+        return sorted(
+            f for f in os.listdir(OUTPUT_DIR) if f.endswith('.xlsx'))
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # ── Bottom bar ────────────────────────────────────────────────
+        # ── Bottom bar (shared date selector) ─────────────────────────
         bar = tk.Frame(self.root, relief='ridge', bd=2, pady=6, bg='#e8e8e8')
         bar.pack(side='bottom', fill='x')
 
@@ -101,17 +112,39 @@ class DailyAnalysisApp:
             self.panels.append(p)
 
     def _make_panel(self, parent, idx):
-        """Build one (controls + figure) panel.  Returns state dict."""
+        """Build one (controls + figure) panel. Returns state dict."""
         outer = tk.Frame(parent, bd=2, relief='groove')
 
         # ── Left control strip ────────────────────────────────────────
-        ctrl = tk.Frame(outer, width=215, bg='#f0f0f0')
+        ctrl = tk.Frame(outer, width=225, bg='#f0f0f0')
         ctrl.pack(side='left', fill='y', padx=2, pady=2)
         ctrl.pack_propagate(False)
 
         tk.Label(ctrl, text=f"  Graph {idx + 1}",
                  font=('Arial', 10, 'bold'), bg='#f0f0f0',
-                 anchor='w').pack(fill='x', pady=(10, 4))
+                 anchor='w').pack(fill='x', pady=(10, 2))
+
+        # ── File selector ─────────────────────────────────────────────
+        tk.Label(ctrl, text="File:", font=('Arial', 8, 'bold'),
+                 bg='#f0f0f0', anchor='w').pack(fill='x', padx=6)
+
+        file_var = tk.StringVar()
+        file_combo = ttk.Combobox(ctrl, textvariable=file_var,
+                                  width=22, state='readonly', font=('Arial', 8))
+        file_combo['values'] = self._available_files()
+        file_combo.pack(fill='x', padx=6, pady=(1, 0))
+
+        tk.Button(ctrl, text="Load file",
+                  command=lambda i=idx: self._load_panel(i),
+                  width=14, font=('Arial', 8)).pack(pady=(3, 0))
+
+        # Label showing currently loaded file
+        loaded_label = tk.Label(ctrl, text="(no file loaded)",
+                                font=('Arial', 7, 'italic'), fg='#888888',
+                                bg='#f0f0f0', anchor='w', wraplength=200)
+        loaded_label.pack(fill='x', padx=6, pady=(1, 4))
+
+        ttk.Separator(ctrl, orient='horizontal').pack(fill='x', padx=6, pady=4)
 
         sel_vars   = []
         sel_combos = []
@@ -123,7 +156,7 @@ class DailyAnalysisApp:
 
             # ── Selector row ──────────────────────────────────────────
             top_row = tk.Frame(ctrl, bg='#f0f0f0')
-            top_row.pack(fill='x', padx=6, pady=(6, 0))
+            top_row.pack(fill='x', padx=6, pady=(4, 0))
 
             tk.Label(top_row, text='●', fg=color,
                      bg='#f0f0f0', font=('Arial', 12)).pack(side='left')
@@ -174,47 +207,82 @@ class DailyAnalysisApp:
         canvas.get_tk_widget().pack(side='left', fill='both', expand=True)
 
         return {
-            'outer':      outer,
-            'sel_vars':   sel_vars,
-            'sel_combos': sel_combos,
-            'ymin_vars':  ymin_vars,
-            'ymax_vars':  ymax_vars,
-            'fig':        fig,
-            'canvas':     canvas,
+            'outer':        outer,
+            'file_var':     file_var,
+            'file_combo':   file_combo,
+            'loaded_label': loaded_label,
+            'sel_vars':     sel_vars,
+            'sel_combos':   sel_combos,
+            'ymin_vars':    ymin_vars,
+            'ymax_vars':    ymax_vars,
+            'fig':          fig,
+            'canvas':       canvas,
+            'df':           None,
         }
 
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_data(self):
-        path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), RESULTS_FILE)
+    def _auto_load_panels(self):
+        """On startup, pre-load the first available file into both panels."""
+        files = self._available_files()
+        if not files:
+            return
+        for i, p in enumerate(self.panels):
+            # Load first file into panel 0, second (if exists) into panel 1
+            fname = files[min(i, len(files) - 1)]
+            p['file_var'].set(fname)
+            self._load_panel(i)
 
-        if not os.path.exists(path):
-            messagebox.showerror(
-                "File not found",
-                f"'{RESULTS_FILE}' not found.\nPlease run optimise.py first.")
+    def _load_panel(self, idx):
+        """Load the selected file into panel idx and refresh."""
+        p     = self.panels[idx]
+        fname = p['file_var'].get()
+        if not fname:
             return
 
-        self.df = pd.read_csv(path, parse_dates=['DateTime'])
+        path = os.path.join(OUTPUT_DIR, fname)
+        if not os.path.exists(path):
+            messagebox.showerror("File not found", f"'{fname}' not found in Output/.")
+            return
 
-        dates = sorted(
-            self.df['DateTime'].dt.date.unique().astype(str).tolist())
-        self.date_combo['values'] = dates
-        if dates:
-            self.date_var.set(dates[0])
+        try:
+            df = pd.read_excel(path, sheet_name='Results',
+                               parse_dates=['DateTime'], engine='calamine')
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+            return
 
+        p['df'] = df
+        p['loaded_label'].config(text=fname)
+
+        # Update column selectors for this panel
         cols = ['— none —'] + [
-            c for c in self.df.columns
-            if c != 'DateTime'
-            and pd.api.types.is_numeric_dtype(self.df[c])
+            c for c in df.columns
+            if c != 'DateTime' and pd.api.types.is_numeric_dtype(df[c])
         ]
-        for p in self.panels:
-            for combo in p['sel_combos']:
-                combo['values'] = cols
+        for combo in p['sel_combos']:
+            current = combo.get()
+            combo['values'] = cols
+            if current not in cols:
+                combo.set('— none —')
 
-        self._refresh_all()
+        self._update_dates()
+        self._redraw(idx)
+
+    def _update_dates(self):
+        """Recompute shared date list as union across all loaded panels."""
+        all_dates = set()
+        for p in self.panels:
+            if p['df'] is not None:
+                all_dates.update(
+                    p['df']['DateTime'].dt.date.unique().astype(str))
+        dates = sorted(all_dates)
+        self.date_combo['values'] = dates
+        if dates and self.date_var.get() not in dates:
+            self.date_var.set(dates[0])
+            self._refresh_all()
 
     # ------------------------------------------------------------------
     # Drawing
@@ -224,12 +292,13 @@ class DailyAnalysisApp:
         self._redraw(0)
         self._redraw(1)
 
-    def _day_df(self):
+    def _day_df(self, idx):
+        p        = self.panels[idx]
         date_str = self.date_var.get()
-        if not date_str or self.df is None:
+        if not date_str or p['df'] is None:
             return None
-        mask = self.df['DateTime'].dt.date.astype(str) == date_str
-        d    = self.df[mask].copy()
+        mask = p['df']['DateTime'].dt.date.astype(str) == date_str
+        d    = p['df'][mask].copy()
         return d if not d.empty else None
 
     def _redraw(self, idx):
@@ -237,14 +306,14 @@ class DailyAnalysisApp:
         fig = p['fig']
         fig.clear()
 
-        day = self._day_df()
+        day = self._day_df(idx)
         if day is None:
             p['canvas'].draw()
             return
 
         t = day['DateTime']
 
-        # Collect active curve slots (preserves slot index for colour/override)
+        # Collect active curve slots
         active = [
             (ci, var.get())
             for ci, var in enumerate(p['sel_vars'])
@@ -257,8 +326,7 @@ class DailyAnalysisApp:
 
         n = len(active)
 
-        # ── Adjust figure margins to make room for right-side axes ────
-        # Each extra right axis needs ~0.08 of figure width
+        # ── Adjust figure margins ─────────────────────────────────────
         right_margin = max(0.60, 0.93 - 0.08 * max(0, n - 1))
         fig.subplots_adjust(left=0.13, right=right_margin,
                             top=0.92, bottom=0.28)
@@ -273,14 +341,13 @@ class DailyAnalysisApp:
                 ('outward', AXIS_OFFSETS[k - 1]))
             axes.append(ax_twin)
 
-        # Hide right spine on main axis when twins are present
         if n > 1:
             ax_main.spines['right'].set_visible(False)
 
-        # ── Plot each curve on its own axis ───────────────────────────
+        # ── Plot each curve ───────────────────────────────────────────
         legend_handles = []
         legend_labels  = []
-        bound_added    = set()   # track which bounds were added to legend
+        bound_added    = set()
 
         for plot_idx, (ci, col) in enumerate(active):
             ax    = axes[plot_idx]
@@ -289,12 +356,10 @@ class DailyAnalysisApp:
             line, = ax.plot(t, day[col], color=color,
                             linewidth=1.7, label=col)
 
-            # Colour the Y-axis to match the curve
             ax.set_ylabel(col, color=color, fontsize=7, labelpad=3)
             ax.tick_params(axis='y', colors=color, labelsize=7)
             ax.spines['right' if plot_idx > 0 else 'left'].set_color(color)
 
-            # Per-curve Y-axis override
             try:
                 ylo = float(p['ymin_vars'][ci].get())
                 yhi = float(p['ymax_vars'][ci].get())
@@ -303,7 +368,6 @@ class DailyAnalysisApp:
             except ValueError:
                 pass
 
-            # Auto Min / Max lines for reservoir level columns
             if col in LEVEL_BOUNDS:
                 lo, hi = LEVEL_BOUNDS[col]
                 ax.axhline(lo, color=BOUND_COLOR, lw=1.0,
@@ -324,15 +388,15 @@ class DailyAnalysisApp:
             legend_handles.append(line)
             legend_labels.append(col)
 
-        # ── X-axis and grid (main axis only) ─────────────────────────
+        # ── X-axis, grid, title ───────────────────────────────────────
         ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         ax_main.xaxis.set_major_locator(mdates.HourLocator(interval=3))
         ax_main.grid(True, alpha=0.22, linestyle=':')
         fig.autofmt_xdate(rotation=30)
 
-        ax_main.set_title(self.date_var.get(), fontsize=9, pad=4)
+        title = f"{self.date_var.get()}  —  {p['file_var'].get()}"
+        ax_main.set_title(title, fontsize=8, pad=4)
 
-        # ── Combined legend — placed below the axes ───────────────────
         if legend_handles:
             ax_main.legend(legend_handles, legend_labels,
                            loc='upper center',

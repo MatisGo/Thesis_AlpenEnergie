@@ -122,24 +122,33 @@ def main():
     log.info("Step 4/4 — DNN production forecast ...")
     try:
         import DNN_Prod_Prediction
-        prod_value, prod_date = DNN_Prod_Prediction.run_predict(show_plots=False)
+        results = DNN_Prod_Prediction.run_predict(show_plots=False)
 
-        if prod_value is not None:
+        if results:
             import pandas as pd
 
-            # Convert output CSV to Excel if needed, then add Prod Prediction sheet
             xlsx_path = output_path.replace('.csv', '.xlsx')
-            df_load = pd.read_csv(output_path)
+            df_load   = pd.read_csv(output_path)
+
+            # Daily average summary (one row per day)
+            df_prod = pd.DataFrame({
+                'Date':                  [str(d.date()) for d, v, _ in results],
+                'Predicted_Avg_Prod_kW': [round(float(avg), 1) for _, avg, _ in results],
+            })
+
+            # Intraday distribution (288 × 5-min rows per day, concatenated)
+            dist_frames = [dist for _, _, dist in results if dist is not None]
+            df_dist = pd.concat(dist_frames, ignore_index=True) if dist_frames else None
 
             with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
-                df_load.to_excel(writer, sheet_name='Load Forecast', index=False)
-                df_prod = pd.DataFrame({
-                    'Date':                   [str(prod_date.date())],
-                    'Predicted_Avg_Prod_kW':  [round(float(prod_value), 1)],
-                })
+                df_load.to_excel(writer, sheet_name='Load Forecast',   index=False)
                 df_prod.to_excel(writer, sheet_name='Prod Prediction', index=False)
+                if df_dist is not None:
+                    df_dist.to_excel(writer, sheet_name='Prod Distribution', index=False)
 
-            log.info(f"  Production forecast: {prod_value:,.1f} kW avg for {prod_date.date()}")
+            for d, v, dist in results:
+                dist_info = f"  +distribution ({len(dist)} rows)" if dist is not None else ""
+                log.info(f"  Production forecast: {v:,.1f} kW avg for {d.date()}{dist_info}")
             log.info(f"  Output (Excel): {xlsx_path}")
         else:
             log.warning("  Production forecast skipped (no model or weather data).")
