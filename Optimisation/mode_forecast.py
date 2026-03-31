@@ -61,7 +61,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
     day_df   = day_df.reset_index(drop=True)
     N        = len(day_df)
     demand   = day_df['Consumption_kW'].tolist()
-    price    = day_df['Spot_Price_CHF_MWh'].tolist()
+    price    = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
@@ -126,6 +126,10 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
         opt_spill_b.append(spill_b); opt_spill_h.append(spill_h)
         opt_state.append(state)
 
+    da_price = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
+    id_price = day_df['Intra_Day_Price_EUR_MWh'].tolist()
+    forecast_list = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
+
     attach_common_results(
         day_df, opt_m2, opt_m1, opt_lb, opt_lh,
         opt_spill_b, opt_spill_h,
@@ -133,9 +137,23 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
         mode_name='FORECAST',
     )
 
+    # Forecast-specific pricing
+    # DA: net scheduled position — cost when consuming more than forecast
+    da_component = [
+        -(demand[t] - forecast_list[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+        for t in range(N)]
+    # Intraday: absolute deviation from forecast always costs money
+    id_component = [
+        -abs(opt_m2[t] + opt_m1[t] - forecast_list[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        for t in range(N)]
+
+    day_df['Opt_DA_Trading_EUR']   = da_component
+    day_df['Opt_ID_Imbalance_EUR'] = id_component
+    day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
+
     # Forecast-specific extra columns
     day_df['Forecast_Drift_kW'] = [
-        (opt_m2[t] + opt_m1[t]) - float(day_df.loc[t, 'Forecast_kW'])
+        (opt_m2[t] + opt_m1[t]) - forecast_list[t]
         for t in range(N)]
     day_df['Opt_Recovery_State'] = opt_state
 

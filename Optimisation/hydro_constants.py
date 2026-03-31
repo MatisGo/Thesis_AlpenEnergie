@@ -75,10 +75,17 @@ def load_data(path: str) -> pd.DataFrame:
     """Read matis_2025_.xlsx and return a clean DataFrame."""
     raw = pd.read_excel(path, header=None, skiprows=3, engine='calamine')
 
-    df = raw.iloc[:, [0, 4, 6, 9, 10, 11, 12, 13, 16, 17]].copy()
+    # Column layout (0-indexed, after skiprows=3):
+    #   A=0 DateTime  E=4 Forecast_kW  G=6 Consumption_kW
+    #   J=9 Haselholz_m  K=10 Bidmi_m
+    #   L=11 Day_Ahead_Price_EUR_MWh  M=12 Intra_Day_Price_EUR_MWh
+    #   N=13 Ref_M1_kW  O=14 Ref_M2_kW
+    #   R=17 Haselholz_Inflow_ls  S=18 Bidmi_Inflow_ls
+    df = raw.iloc[:, [0, 4, 6, 9, 10, 11, 12, 13, 14, 17, 18]].copy()
     df.columns = [
         'DateTime', 'Forecast_kW', 'Consumption_kW',
-        'Haselholz_m', 'Bidmi_m', 'Spot_Price_CHF_MWh',
+        'Haselholz_m', 'Bidmi_m',
+        'Day_Ahead_Price_EUR_MWh', 'Intra_Day_Price_EUR_MWh',
         'Ref_M1_kW', 'Ref_M2_kW',
         'Haselholz_Inflow_ls', 'Bidmi_Inflow_ls',
     ]
@@ -88,7 +95,8 @@ def load_data(path: str) -> pd.DataFrame:
 
     numeric_cols = [
         'Forecast_kW', 'Consumption_kW', 'Haselholz_m', 'Bidmi_m',
-        'Spot_Price_CHF_MWh', 'Ref_M1_kW', 'Ref_M2_kW',
+        'Day_Ahead_Price_EUR_MWh', 'Intra_Day_Price_EUR_MWh',
+        'Ref_M1_kW', 'Ref_M2_kW',
         'Haselholz_Inflow_ls', 'Bidmi_Inflow_ls',
     ]
     for col in numeric_cols:
@@ -99,8 +107,8 @@ def load_data(path: str) -> pd.DataFrame:
     df['Haselholz_mm'] = df['Haselholz_m'] * 1000
 
     ref_prod = df['Ref_M2_kW'] + df['Ref_M1_kW']
-    df['Ref_Energy_Trading_CHF'] = (
-        (ref_prod - df['Consumption_kW']) * TIMESTEP_HOURS * df['Spot_Price_CHF_MWh'] / 1000
+    df['Ref_Energy_Trading_EUR'] = (
+        (ref_prod - df['Consumption_kW']) * TIMESTEP_HOURS * df['Day_Ahead_Price_EUR_MWh'] / 1000
     )
     return df
 
@@ -196,7 +204,7 @@ def attach_common_results(day_df, opt_m2, opt_m1, opt_lb, opt_lh,
     day_df['Opt_Bidmi_mm']      = opt_lb
     day_df['Opt_Haselholz_mm']  = opt_lh
 
-    day_df['Opt_Energy_Trading_CHF'] = [
+    day_df['Opt_Energy_Trading_EUR'] = [
         (opt_p[t] - demand[t]) * TIMESTEP_HOURS * price[t] / 1000.0
         for t in range(N)]
 

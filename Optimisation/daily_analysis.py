@@ -262,11 +262,19 @@ class DailyAnalysisApp:
             c for c in df.columns
             if c != 'DateTime' and pd.api.types.is_numeric_dtype(df[c])
         ]
-        for combo in p['sel_combos']:
+        defaults = [
+            'Forecast_kW',
+            'Opt_Production_kW',
+            'Opt_Bidmi_mm',
+            'Opt_Haselholz_mm',
+        ]
+        for j, combo in enumerate(p['sel_combos']):
             current = combo.get()
             combo['values'] = cols
             if current not in cols:
-                combo.set('— none —')
+                # Apply default if available, otherwise clear
+                default = defaults[j] if j < len(defaults) else '— none —'
+                combo.set(default if default in cols else '— none —')
 
         self._update_dates()
         self._redraw(idx)

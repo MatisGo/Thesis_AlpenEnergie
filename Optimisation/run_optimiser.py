@@ -17,36 +17,31 @@ import pandas as pd
 
 from hydro_constants import (
     DATA_FILENAME, TIMESTEP_HOURS,
-    load_data, compute_seasonal_targets, compute_intraday_targets,
+    load_data, compute_seasonal_targets,
 )
 
 # ===========================================================================
 #  SELECT MODE HERE
 # ===========================================================================
 #
-#   'FORECAST'         Rule-based 3-state equalization (follows CNN/LSTM forecast)
-#   'PRICE_ARBITRAGE'  Pure LP profit maximisation
-#   'WATER_VALUE'      LP that follows forecast + optimises production timing
-#   'WATER_LEVEL'      Both turbines off (reservoir recovery)
+#   'FORECAST'      Rule-based 3-state equalization (follows CNN/LSTM forecast)
+#   'WATER_VALUE'   LP that minimises intraday imbalance costs
+#   'WATER_LEVEL'   Both turbines off (reservoir recovery)
 #
-MODE = 'WATER_VALUE'
+MODE = 'WATER_LEVEL'
 # ===========================================================================
 
 OUTPUT_FILENAME = {
-    'FORECAST':        'Forecast_results.xlsx',
-    'PRICE_ARBITRAGE': 'Price_Arbitrage_results.xlsx',
-    'WATER_VALUE':     'Water_Value_results.xlsx',
-    'WATER_LEVEL':     'Water_Level_results.xlsx',
+    'FORECAST':    'Forecast_results.xlsx',
+    'WATER_VALUE': 'Water_Value_results.xlsx',
+    'WATER_LEVEL': 'Water_Level_results.xlsx',
 }.get(MODE, 'results.xlsx')
 
 # Import the correct mode module
 if MODE == 'FORECAST':
     from mode_forecast import dispatch_day
-elif MODE == 'PRICE_ARBITRAGE':
-    from mode_price_arbitrage import dispatch_day, get_solver
 elif MODE == 'WATER_VALUE':
-    from mode_water_value import dispatch_day
-    from mode_price_arbitrage import get_solver
+    from mode_water_value import dispatch_day, get_solver
 elif MODE == 'WATER_LEVEL':
     from mode_water_level import dispatch_day
 else:
@@ -63,10 +58,7 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
     print("Computing seasonal targets...")
     season_targets = compute_seasonal_targets(df)
 
-    # LP modes need intra-day floor targets and a solver
-    needs_lp     = MODE in ('PRICE_ARBITRAGE', 'WATER_VALUE')
-    solver       = get_solver() if needs_lp else None
-    intraday_tgt = compute_intraday_targets(df) if needs_lp else {}
+    solver = get_solver() if MODE == 'WATER_VALUE' else None
 
     days = sorted(df['DateTime'].dt.date.unique())
     if target_date:
@@ -84,7 +76,6 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         day_df = df[df['DateTime'].dt.date == day].copy()
 
         t_lb, t_lh = season_targets.get(day, (None, None))
-        f_lb, f_lh = intraday_tgt.get(day, (None, None))
 
         if t_lb is None: t_lb = float(day_df['Bidmi_mm'].iloc[0])
         if t_lh is None: t_lh = float(day_df['Haselholz_mm'].iloc[0])
@@ -94,15 +85,15 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
 
         day_df = dispatch_day(
             day_df, lb0, lh0, t_lb, t_lh,
-            solver=solver, floor_lb=f_lb, floor_lh=f_lh,
+            solver=solver,
         )
 
         prev_lb = getattr(day_df, '_opt_lb_end', None)
         prev_lh = getattr(day_df, '_opt_lh_end', None)
 
         # Console progress
-        opt_profit = day_df['Opt_Energy_Trading_CHF'].sum()
-        ref_profit = day_df['Ref_Energy_Trading_CHF'].sum()
+        opt_profit = day_df['Opt_Energy_Trading_EUR'].sum()
+        ref_profit = day_df['Ref_Energy_Trading_EUR'].sum()
         dev_b      = getattr(day_df, '_dev_b', float('nan'))
         dev_h      = getattr(day_df, '_dev_h', float('nan'))
         gain       = opt_profit - ref_profit
@@ -111,8 +102,8 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
 
         print(f"[{i:3}/{len(days)}] {day}  "
               f"tgt B={t_lb:.0f} H={t_lh:.0f}  "
-              f"ref {ref_profit:+.2f} CHF  opt {opt_profit:+.2f} CHF  "
-              f"gain {gain:+.2f} CHF  "
+              f"ref {ref_profit:+.2f} EUR  opt {opt_profit:+.2f} EUR  "
+              f"gain {gain:+.2f} EUR  "
               f"dLB={dev_b:+.1f}mm dLH={dev_h:+.1f}mm"
               f"{spill_str}")
 
@@ -127,14 +118,14 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
 
 def save_output(opt_df: pd.DataFrame, output_path: str):
     """Save Results + Summary sheets to Excel."""
-    opt_df['Opt_Total_Energy_Cost_CHF'] = opt_df['Opt_Energy_Trading_CHF'].cumsum()
+    opt_df['Opt_Total_Energy_Cost_EUR'] = opt_df['Opt_Energy_Trading_EUR'].cumsum()
 
-    total_ref  = opt_df['Ref_Energy_Trading_CHF'].sum()
-    total_opt  = opt_df['Opt_Energy_Trading_CHF'].sum()
+    total_ref  = opt_df['Ref_Energy_Trading_EUR'].sum()
+    total_opt  = opt_df['Opt_Energy_Trading_EUR'].sum()
     total_gain = total_opt - total_ref
 
-    daily_ref        = opt_df.groupby(opt_df['DateTime'].dt.date)['Ref_Energy_Trading_CHF'].sum()
-    daily_opt        = opt_df.groupby(opt_df['DateTime'].dt.date)['Opt_Energy_Trading_CHF'].sum()
+    daily_ref        = opt_df.groupby(opt_df['DateTime'].dt.date)['Ref_Energy_Trading_EUR'].sum()
+    daily_opt        = opt_df.groupby(opt_df['DateTime'].dt.date)['Opt_Energy_Trading_EUR'].sum()
     days_opt_better  = (daily_opt > daily_ref).sum()
     days_ref_better  = (daily_opt < daily_ref).sum()
 
@@ -166,9 +157,9 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
 
     summary_rows = [
         ('--- Profit / Cost ---', '', ''),
-        ('Reference profit',   f'{total_ref:+.2f}',   'CHF'),
-        ('Optimised profit',   f'{total_opt:+.2f}',   'CHF'),
-        ('Optimizer gain',     f'{total_gain:+.2f}',  'CHF'),
+        ('Reference profit',   f'{total_ref:+.2f}',   'EUR'),
+        ('Optimised profit',   f'{total_opt:+.2f}',   'EUR'),
+        ('Optimizer gain',     f'{total_gain:+.2f}',  'EUR'),
         ('Days opt better',    days_opt_better,        ''),
         ('Days ref better',    days_ref_better,        ''),
         ('', '', ''),
@@ -199,9 +190,9 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
     # Console summary
     print(f"\n{'─'*55}")
     print(f"  Mode              : {MODE}")
-    print(f"  Reference profit  : {total_ref:+,.2f} CHF")
-    print(f"  Optimised profit  : {total_opt:+,.2f} CHF")
-    print(f"  Gain              : {total_gain:+,.2f} CHF")
+    print(f"  Reference profit  : {total_ref:+,.2f} EUR")
+    print(f"  Optimised profit  : {total_opt:+,.2f} EUR")
+    print(f"  Gain              : {total_gain:+,.2f} EUR")
     print(f"  Ref energy        : {ref_energy_kwh/1000:,.1f} MWh")
     print(f"  Opt energy        : {opt_energy_kwh/1000:,.1f} MWh")
     print(f"  Total spill loss  : {total_spill/1000:,.1f} MWh")

@@ -1,36 +1,34 @@
 """
 mode_water_value.py
 ===================
-WATER_VALUE mode — LP that respects the forecast while optimising timing.
+WATER_VALUE mode — LP that minimises intraday imbalance costs while respecting
+physical constraints.
 
-Core idea
----------
-Every mm of water in a reservoir has an *opportunity cost*: the revenue it
-could generate if used at the best future price.  At each timestep the LP
-must decide whether the current price is worth consuming that water, or
-whether to save it for a more profitable hour later.
+Pricing structure
+-----------------
+The plant submits the CNN/LSTM forecast as its day-ahead bid.  Settlement:
 
-This is implemented as a rolling 24-hour LP with two objectives:
+  DA revenue  = (Forecast - Consumption) × DA_price × dt / 1000   [EUR]
+              → Fixed at scheduling time; the LP cannot influence it.
 
-  1. Revenue    — same as PRICE_ARBITRAGE (maximise spot revenue).
-  2. Forecast   — soft penalty proportional to |production − forecast_kW|.
+  ID cost     = |Production - Forecast| × ID_price × dt / 1000    [EUR]
+              → Always a cost: both over- and under-production are penalised.
 
-FORECAST_WEIGHT controls the trade-off:
-  • High weight → sticks closely to the forecast regardless of prices.
-  • Low weight  → behaves like pure price arbitrage.
-  • The recommended default (0.03 CHF/kW) makes forecast adherence worth
-    roughly 3× the average 5-min energy revenue, so the model follows the
-    forecast except when prices differ significantly from the daily average.
+Because the DA term is a constant, the LP objective is purely:
 
-The thresholds from FORECAST mode disappear entirely.  The LP naturally
-reduces production when reservoir levels are low because low levels raise
-the shadow price of water above the current spot price.
+    Maximise: -Σ |P[t] - Forecast[t]| × ID_price[t] × dt/1000
+            - (terminal + recovery + spill penalties)
+
+The LP naturally follows the forecast.  It only deviates when water
+constraints force it (reservoir full → must produce, reservoir low → recovery).
+The deviation cost is weighted by the live intraday price, so the LP prefers
+to deviate during cheap intraday hours.
 """
 
 import sys
 import pandas as pd
 from pyomo.environ import (
-    ConcreteModel, Set, Var, NonNegativeReals, Reals,
+    ConcreteModel, Set, Var, NonNegativeReals,
     Constraint, Objective, maximize, value, SolverFactory,
 )
 from hydro_constants import (
@@ -39,31 +37,40 @@ from hydro_constants import (
     BIDMI_RANGE, HASELHOLZ_RANGE,
     BIDMI_LS_PER_MM, HASELHOLZ_LS_PER_MM,
     COEFF_M2_BIDMI, COEFF_M2_CASCADE, COEFF_M1_HASELHOLZ,
+    TURBINE_CASCADE_RATIO,
     water_balance_step, spill_to_kwh, attach_common_results,
-)
-from mode_price_arbitrage import (
-    get_solver,
-    TERMINAL_FREE_ZONE, PW_ZONE2_WIDTH, PW_ZONE3_WIDTH,
-    PW_SLOPE2, PW_SLOPE3, PW_SLOPE4,
-    SPILL_PENALTY, INTRADAY_FLOOR_PENALTY,
-    RECOVERY_PENALTY_MM_B, RECOVERY_PENALTY_MM_H, THRESHOLD_B, THRESHOLD_H,
 )
 
 # ---------------------------------------------------------------------------
-# Forecast tracking weight
+# LP parameters
 # ---------------------------------------------------------------------------
-# CHF per kW of deviation from forecast per 5-min timestep.
-# At 100 CHF/MWh avg price: 1 kW earns 100 × (5/60) / 1000 = 0.0083 CHF.
-# FORECAST_WEIGHT = 0.03 → forecast adherence is worth ~3× average revenue.
-FORECAST_WEIGHT = 0.03   # CHF/kW
+
+TERMINAL_FREE_ZONE = 100.0   # mm free zone — no penalty
+PW_ZONE2_WIDTH     = 100.0
+PW_ZONE3_WIDTH     = 100.0
+PW_SLOPE2          =   2.0   # EUR/mm
+PW_SLOPE3          =   8.0   # EUR/mm
+PW_SLOPE4          =  25.0   # EUR/mm
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
+
+def get_solver():
+    solver = SolverFactory('glpk')
+    if not solver.available():
+        print("ERROR: GLPK not found.  Install via: conda install glpk")
+        sys.exit(1)
+    return solver
 
 
 # ---------------------------------------------------------------------------
 # LP model builder
 # ---------------------------------------------------------------------------
 
-def _build_model(N, forecast, demand, price, inflow_b, inflow_h,
-                 lb0, lh0, target_lb, target_lh, floor_lb, floor_lh):
+def _build_model(N, forecast, id_price, inflow_b, inflow_h,
+                 lb0, lh0, target_lb, target_lh):
     m     = ConcreteModel()
     T     = list(range(N))
     T_ext = list(range(N + 1))
@@ -107,13 +114,7 @@ def _build_model(N, forecast, demand, price, inflow_b, inflow_h,
         m.LH[t+1] == m.LH[t] + inflow_h[t] / HASELHOLZ_LS_PER_MM
                      + COEFF_M2_CASCADE * m.P_M2[t] - COEFF_M1_HASELHOLZ * m.P_M1[t] - m.spill_h[t])
 
-    # Intra-day soft floor
-    m.floor_slack_b = Var(m.T, domain=NonNegativeReals)
-    m.floor_slack_h = Var(m.T, domain=NonNegativeReals)
-    m.floor_con_b = Constraint(m.T, rule=lambda m, t: m.floor_slack_b[t] >= floor_lb[t] - m.LB[t])
-    m.floor_con_h = Constraint(m.T, rule=lambda m, t: m.floor_slack_h[t] >= floor_lh[t] - m.LH[t])
-
-    # Piecewise terminal penalty (reuse from price_arbitrage)
+    # Piecewise terminal penalty
     m.dev_b = Var(domain=NonNegativeReals); m.dev_b_con = Constraint(expr=m.dev_b >= target_lb - m.LB[N])
     m.dev_h = Var(domain=NonNegativeReals); m.dev_h_con = Constraint(expr=m.dev_h >= target_lh - m.LH[N])
 
@@ -127,36 +128,26 @@ def _build_model(N, forecast, demand, price, inflow_b, inflow_h,
     m.pw_h4 = Var(domain=NonNegativeReals)
     m.pw_h_link = Constraint(expr=m.pw_h2 + m.pw_h3 + m.pw_h4 >= m.dev_h - TERMINAL_FREE_ZONE)
 
-    # Recovery soft penalty (same calibration as price_arbitrage)
-    m.deficit_b = Var(m.T, domain=NonNegativeReals)
-    m.deficit_h = Var(m.T, domain=NonNegativeReals)
-    m.deficit_b_con = Constraint(m.T, rule=lambda m, t: m.deficit_b[t] >= THRESHOLD_B - m.LB[t])
-    m.deficit_h_con = Constraint(m.T, rule=lambda m, t: m.deficit_h[t] >= THRESHOLD_H - m.LH[t])
-
-    # ── Forecast tracking: linearised |production − forecast| ────────────
-    # dev_pos[t] - dev_neg[t] = production[t] - forecast[t]
-    # penalty = FORECAST_WEIGHT × (dev_pos + dev_neg)
+    # Intraday imbalance: linearised |production - forecast|
+    # dev_pos[t] - dev_neg[t] = P[t] - forecast[t]
+    # cost = id_price[t] × (dev_pos[t] + dev_neg[t]) × dt / 1000
     m.dev_pos = Var(m.T, domain=NonNegativeReals)
     m.dev_neg = Var(m.T, domain=NonNegativeReals)
-    m.forecast_con = Constraint(m.T, rule=lambda m, t:
+    m.imbalance_con = Constraint(m.T, rule=lambda m, t:
         m.dev_pos[t] - m.dev_neg[t] == m.P_M2[t] + m.P_M1[t] - forecast[t])
 
-    # Objective
-    revenue = sum(
-        (m.P_M2[t] + m.P_M1[t] - demand[t]) * TIMESTEP_HOURS * price[t] / 1000.0
+    # Objective — no direct revenue term; DA settlement is a constant
+    # Use abs(id_price) so negative intraday prices don't make imbalance a reward
+    # (which would make the LP unbounded).
+    imbalance_cost = sum(
+        abs(id_price[t]) * (m.dev_pos[t] + m.dev_neg[t]) * TIMESTEP_HOURS / 1000.0
         for t in m.T)
     penalties = (
         - PW_SLOPE2 * (m.pw_b2 + m.pw_h2)
         - PW_SLOPE3 * (m.pw_b3 + m.pw_h3)
         - PW_SLOPE4 * (m.pw_b4 + m.pw_h4)
-        - SPILL_PENALTY * (sum(m.spill_b[t] for t in m.T) + sum(m.spill_h[t] for t in m.T))
-        - INTRADAY_FLOOR_PENALTY * (
-            sum(m.floor_slack_b[t] for t in m.T) + sum(m.floor_slack_h[t] for t in m.T))
-        - RECOVERY_PENALTY_MM_B * sum(m.deficit_b[t] for t in m.T)
-        - RECOVERY_PENALTY_MM_H * sum(m.deficit_h[t] for t in m.T)
-        - FORECAST_WEIGHT * sum(m.dev_pos[t] + m.dev_neg[t] for t in m.T)
     )
-    m.obj = Objective(expr=revenue + penalties, sense=maximize)
+    m.obj = Objective(expr=-imbalance_cost + penalties, sense=maximize)
     return m
 
 
@@ -165,25 +156,18 @@ def _build_model(N, forecast, demand, price, inflow_b, inflow_h,
 # ---------------------------------------------------------------------------
 
 def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
-                 solver=None, floor_lb=None, floor_lh=None, **_kwargs):
+                 solver=None, **_kwargs):
     day_df   = day_df.reset_index(drop=True)
     N        = len(day_df)
     forecast = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
     demand   = day_df['Consumption_kW'].tolist()
-    price    = day_df['Spot_Price_CHF_MWh'].tolist()
+    da_price = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
+    id_price = day_df['Intra_Day_Price_EUR_MWh'].tolist()
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
-    def _fit(arr, fill):
-        if arr is None: return [fill] * N
-        arr = list(arr)[:N];  arr += [fill] * (N - len(arr))
-        return arr
-
-    floor_lb = _fit(floor_lb, BIDMI_LEVEL_MIN)
-    floor_lh = _fit(floor_lh, HASELHOLZ_LEVEL_MIN)
-
-    model  = _build_model(N, forecast, demand, price, inflow_b, inflow_h,
-                          lb0, lh0, target_lb, target_lh, floor_lb, floor_lh)
+    model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
+                          lb0, lh0, target_lb, target_lh)
     result = solver.solve(model, tee=False)
     status = str(result.solver.termination_condition)
 
@@ -192,8 +176,17 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
         zeros = [0.0] * N
         attach_common_results(
             day_df, zeros, zeros, [lb0] * N, [lh0] * N, zeros, zeros,
-            demand, price, target_lb, target_lh, mode_name='WATER_VALUE',
+            demand, da_price, target_lb, target_lh, mode_name='WATER_VALUE',
         )
+        day_df['Opt_DA_Trading_EUR']   = [
+            (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+            for t in range(N)]
+        day_df['Opt_ID_Imbalance_EUR'] = [
+            -abs(forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+        day_df['Opt_Energy_Trading_EUR'] = [
+            day_df['Opt_DA_Trading_EUR'].iloc[t] + day_df['Opt_ID_Imbalance_EUR'].iloc[t]
+            for t in range(N)]
         day_df['Forecast_Drift_kW'] = [-f for f in forecast]
         return day_df
 
@@ -204,12 +197,25 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     opt_spill_b = [value(model.spill_b[t])  for t in range(N)]
     opt_spill_h = [value(model.spill_h[t])  for t in range(N)]
 
+    # attach_common_results sets a generic Opt_Energy_Trading_EUR — we override it below
     attach_common_results(
         day_df, opt_m2, opt_m1, opt_lb, opt_lh,
         opt_spill_b, opt_spill_h,
-        demand, price, target_lb, target_lh,
+        demand, da_price, target_lb, target_lh,
         mode_name='WATER_VALUE',
     )
+
+    # Correct pricing
+    da_component = [
+        (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+        for t in range(N)]
+    id_component = [
+        -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        for t in range(N)]
+
+    day_df['Opt_DA_Trading_EUR']   = da_component
+    day_df['Opt_ID_Imbalance_EUR'] = id_component
+    day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
 
     day_df['Forecast_Drift_kW'] = [
         (opt_m2[t] + opt_m1[t]) - forecast[t] for t in range(N)]
