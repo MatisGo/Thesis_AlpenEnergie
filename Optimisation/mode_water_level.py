@@ -12,17 +12,28 @@ Pricing (same structure as FORECAST and WATER_VALUE modes)
   DA component  = (Forecast - Consumption) × DA_price × dt / 1000   [EUR]
                   Fixed scheduled position submitted to the day-ahead market.
 
-  ID component  = -|Production - Forecast| × ID_price × dt / 1000  [EUR]
+  ID component  = -|Grid_export - Forecast| × ID_price × dt / 1000  [EUR]
                   Absolute deviation from forecast always costs money.
+                  When battery FORECAST mode is active, grid export = turbine +
+                  battery_net, so the battery can reduce the ID cost.
 """
 
 from hydro_constants import (
     P_MAX_M2, P_MAX_M1, TIMESTEP_HOURS,
+    BIDMI_LEVEL_MIN, HASELHOLZ_LEVEL_MIN,
+    BIDMI_RANGE, HASELHOLZ_RANGE,
     water_balance_step, attach_common_results,
 )
+from battery_control import battery_step_forecast
 
 
-def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
+def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
+                 seasonal_prod=None, **_kwargs):
+    """
+    battery_cfg : BatteryConfig or None.
+      If mode == 'FORECAST', battery is co-simulated at each timestep
+      (same architecture as mode_forecast.py).
+    """
     day_df   = day_df.reset_index(drop=True)
     N        = len(day_df)
     demand   = day_df['Consumption_kW'].tolist()
@@ -32,16 +43,49 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
+    co_sim = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    soc    = battery_cfg.soc0 if co_sim else 0.0
+
     opt_m2, opt_m1           = [], []
     opt_lb, opt_lh           = [], []
     opt_spill_b, opt_spill_h = [], []
+    batt_c_list, batt_d_list, batt_soc_list = [], [], []
 
     lb, lh = lb0, lh0
 
     for t in range(N):
-        # Follow historical reference production, clipped to physical limits
-        m2 = max(0.0, min(P_MAX_M2, float(day_df.loc[t, 'Ref_M2_kW'])))
-        m1 = max(0.0, min(P_MAX_M1, float(day_df.loc[t, 'Ref_M1_kW'])))
+        norm_lb = (lb - BIDMI_LEVEL_MIN)     / BIDMI_RANGE
+        norm_lh = (lh - HASELHOLZ_LEVEL_MIN) / HASELHOLZ_RANGE
+
+        # Battery co-simulation: decide before turbine runs, adjust target
+        if co_sim:
+            batt_soc_list.append(soc)
+            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh)
+        else:
+            batt_c = batt_d = 0.0
+        batt_c_list.append(batt_c)
+        batt_d_list.append(batt_d)
+
+        # Follow seasonal average production (30-day rolling avg), falling back
+        # to raw reference if seasonal data is unavailable for this day.
+        # Charging → turbine produces target + charge (releases more water)
+        # Discharging → turbine produces target − discharge (saves water)
+        if seasonal_prod is not None and t < len(seasonal_prod[0]):
+            ref_m2 = max(0.0, min(P_MAX_M2, float(seasonal_prod[0][t])))
+            ref_m1 = max(0.0, min(P_MAX_M1, float(seasonal_prod[1][t])))
+        else:
+            ref_m2 = max(0.0, min(P_MAX_M2, float(day_df.loc[t, 'Ref_M2_kW'])))
+            ref_m1 = max(0.0, min(P_MAX_M1, float(day_df.loc[t, 'Ref_M1_kW'])))
+        ref_total = ref_m2 + ref_m1
+
+        if co_sim and (batt_c > 0 or batt_d > 0):
+            # Scale both turbines proportionally to reach adjusted target
+            target_total = max(0.0, ref_total + batt_c - batt_d)
+            scale = target_total / ref_total if ref_total > 0 else 0.0
+            m2 = max(0.0, min(P_MAX_M2, ref_m2 * scale))
+            m1 = max(0.0, min(P_MAX_M1, ref_m1 * scale))
+        else:
+            m2, m1 = ref_m2, ref_m1
 
         lb, lh, spill_b, spill_h = water_balance_step(lb, lh, m2, m1, inflow_b[t], inflow_h[t])
 
@@ -52,23 +96,38 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, **_kwargs):
     attach_common_results(
         day_df, opt_m2, opt_m1, opt_lb, opt_lh,
         opt_spill_b, opt_spill_h,
-        demand, da_price, target_lb, target_lh,
+        demand, target_lb, target_lh,
         mode_name='WATER_LEVEL',
     )
 
-    # Correct pricing: DA scheduled position + ID imbalance cost
     da_component = [
         (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
         for t in range(N)]
-    id_component = [
-        -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
-        for t in range(N)]
 
-    day_df['Opt_DA_Trading_EUR']   = da_component
-    day_df['Opt_ID_Imbalance_EUR'] = id_component
+    if co_sim:
+        grid_out = [opt_m2[t] + opt_m1[t] + batt_d_list[t] - batt_c_list[t]
+                    for t in range(N)]
+        id_component = [
+            -abs(grid_out[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+        id_hydro_only = [
+            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+        day_df['Batt_Charge_kW']    = batt_c_list
+        day_df['Batt_Discharge_kW'] = batt_d_list
+        day_df['Batt_SOC_kWh']      = batt_soc_list
+        day_df['Batt_Net_kW']       = [batt_d_list[t] - batt_c_list[t] for t in range(N)]
+        day_df['Batt_Revenue_EUR']  = [id_component[t] - id_hydro_only[t] for t in range(N)]
+        day_df._batt_soc_end        = soc
+    else:
+        id_component = [
+            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+
+    day_df['Opt_DA_Trading_EUR']     = da_component
+    day_df['Opt_ID_Imbalance_EUR']   = id_component
     day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
-
-    day_df['Forecast_Drift_kW'] = [
+    day_df['Forecast_Drift_kW']      = [
         (opt_m2[t] + opt_m1[t]) - forecast[t] for t in range(N)]
 
     return day_df

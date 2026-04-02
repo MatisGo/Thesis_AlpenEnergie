@@ -40,6 +40,9 @@ from hydro_constants import (
     TURBINE_CASCADE_RATIO,
     water_balance_step, spill_to_kwh, attach_common_results,
 )
+from battery_control import (
+    EFF_CHARGE, EFF_DISCHARGE, SOC_MIN, SOC_MAX, _P_MAX_BATT,
+)
 
 # ---------------------------------------------------------------------------
 # LP parameters
@@ -70,7 +73,16 @@ def get_solver():
 # ---------------------------------------------------------------------------
 
 def _build_model(N, forecast, id_price, inflow_b, inflow_h,
-                 lb0, lh0, target_lb, target_lh):
+                 lb0, lh0, target_lb, target_lh, battery_cfg=None):
+    """
+    Build the WATER_VALUE LP.
+
+    battery_cfg : BatteryConfig or None.
+      When mode == 'FORECAST', battery variables (charge, discharge, SOC) are
+      added to the LP.  The imbalance constraint is written on the NET GRID
+      export (turbine + battery_net) so the LP can use the battery to reduce
+      ID costs.  The LP stays fully linear (no binary variables needed).
+    """
     m     = ConcreteModel()
     T     = list(range(N))
     T_ext = list(range(N + 1))
@@ -106,7 +118,8 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.ramp_m1_up = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M1, 'up'))
     m.ramp_m1_dn = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M1, 'dn'))
 
-    # Water balance
+    # Water balance — uses turbine output only (battery is at grid connection,
+    # not in the water circuit)
     m.wb_b = Constraint(m.T, rule=lambda m, t:
         m.LB[t+1] == m.LB[t] + inflow_b[t] / BIDMI_LS_PER_MM
                      - COEFF_M2_BIDMI * m.P_M2[t] - m.spill_b[t])
@@ -128,17 +141,36 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.pw_h4 = Var(domain=NonNegativeReals)
     m.pw_h_link = Constraint(expr=m.pw_h2 + m.pw_h3 + m.pw_h4 >= m.dev_h - TERMINAL_FREE_ZONE)
 
-    # Intraday imbalance: linearised |production - forecast|
-    # dev_pos[t] - dev_neg[t] = P[t] - forecast[t]
-    # cost = id_price[t] × (dev_pos[t] + dev_neg[t]) × dt / 1000
+    # Intraday imbalance vars — linearised |grid_export - forecast|
     m.dev_pos = Var(m.T, domain=NonNegativeReals)
     m.dev_neg = Var(m.T, domain=NonNegativeReals)
-    m.imbalance_con = Constraint(m.T, rule=lambda m, t:
-        m.dev_pos[t] - m.dev_neg[t] == m.P_M2[t] + m.P_M1[t] - forecast[t])
 
-    # Objective — no direct revenue term; DA settlement is a constant
-    # Use abs(id_price) so negative intraday prices don't make imbalance a reward
-    # (which would make the LP unbounded).
+    # Battery variables (FORECAST battery mode only)
+    with_battery = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    if with_battery:
+        soc0_clamped = max(SOC_MIN, min(SOC_MAX, battery_cfg.soc0))
+        m.batt_c   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
+        m.batt_d   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
+        m.batt_SOC = Var(m.T_ext, domain=NonNegativeReals)
+        m.batt_SOC[0].fix(soc0_clamped)
+        m.batt_soc_lo = Constraint([t for t in T_ext if t >= 1],
+                                   rule=lambda m, t: m.batt_SOC[t] >= SOC_MIN)
+        m.batt_soc_hi = Constraint([t for t in T_ext if t >= 1],
+                                   rule=lambda m, t: m.batt_SOC[t] <= SOC_MAX)
+        m.batt_soc_bal = Constraint(m.T, rule=lambda m, t:
+            m.batt_SOC[t + 1] == m.batt_SOC[t]
+                               + m.batt_c[t] * EFF_CHARGE    * TIMESTEP_HOURS
+                               - m.batt_d[t] / EFF_DISCHARGE * TIMESTEP_HOURS)
+        # Imbalance on NET GRID export: turbine + battery_net
+        m.imbalance_con = Constraint(m.T, rule=lambda m, t:
+            m.dev_pos[t] - m.dev_neg[t] ==
+                m.P_M2[t] + m.P_M1[t] + m.batt_d[t] - m.batt_c[t] - forecast[t])
+    else:
+        # No battery — imbalance on turbine output only
+        m.imbalance_con = Constraint(m.T, rule=lambda m, t:
+            m.dev_pos[t] - m.dev_neg[t] == m.P_M2[t] + m.P_M1[t] - forecast[t])
+
+    # Objective — minimise ID imbalance cost + terminal penalties
     imbalance_cost = sum(
         abs(id_price[t]) * (m.dev_pos[t] + m.dev_neg[t]) * TIMESTEP_HOURS / 1000.0
         for t in m.T)
@@ -156,38 +188,55 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
 # ---------------------------------------------------------------------------
 
 def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
-                 solver=None, **_kwargs):
-    day_df   = day_df.reset_index(drop=True)
-    N        = len(day_df)
-    forecast = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
-    demand   = day_df['Consumption_kW'].tolist()
-    da_price = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
-    id_price = day_df['Intra_Day_Price_EUR_MWh'].tolist()
-    inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
-    inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
+                 solver=None, battery_cfg=None, **_kwargs):
+    """
+    battery_cfg : BatteryConfig or None.
+      'FORECAST' mode → battery vars added to LP; LP jointly minimises
+                        ID imbalance on net grid export (hydro + battery).
+                        Battery columns and _batt_soc_end written to day_df.
+      'DAY_AHEAD' mode or None → battery_cfg ignored here; handled separately.
+    """
+    day_df      = day_df.reset_index(drop=True)
+    N           = len(day_df)
+    forecast    = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
+    demand      = day_df['Consumption_kW'].tolist()
+    da_price    = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
+    id_price    = day_df['Intra_Day_Price_EUR_MWh'].tolist()
+    inflow_b    = day_df['Bidmi_Inflow_ls'].tolist()
+    inflow_h    = day_df['Haselholz_Inflow_ls'].tolist()
+    with_batt   = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
 
     model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
-                          lb0, lh0, target_lb, target_lh)
+                          lb0, lh0, target_lb, target_lh,
+                          battery_cfg=battery_cfg if with_batt else None)
     result = solver.solve(model, tee=False)
     status = str(result.solver.termination_condition)
 
     if status not in ('optimal', 'feasible'):
         print(f"  WARNING: solver status '{status}' on {day_df.loc[0,'DateTime'].date()} — filling with zeros")
+        day_df._failed = 1
         zeros = [0.0] * N
         attach_common_results(
             day_df, zeros, zeros, [lb0] * N, [lh0] * N, zeros, zeros,
-            demand, da_price, target_lb, target_lh, mode_name='WATER_VALUE',
+            demand, target_lb, target_lh, mode_name='WATER_VALUE',
         )
-        day_df['Opt_DA_Trading_EUR']   = [
+        day_df['Opt_DA_Trading_EUR']     = [
             (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
             for t in range(N)]
-        day_df['Opt_ID_Imbalance_EUR'] = [
+        day_df['Opt_ID_Imbalance_EUR']   = [
             -abs(forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
             for t in range(N)]
         day_df['Opt_Energy_Trading_EUR'] = [
             day_df['Opt_DA_Trading_EUR'].iloc[t] + day_df['Opt_ID_Imbalance_EUR'].iloc[t]
             for t in range(N)]
         day_df['Forecast_Drift_kW'] = [-f for f in forecast]
+        if with_batt:
+            day_df['Batt_Charge_kW']    = zeros
+            day_df['Batt_Discharge_kW'] = zeros
+            day_df['Batt_SOC_kWh']      = [battery_cfg.soc0] * N
+            day_df['Batt_Net_kW']       = zeros
+            day_df['Batt_Revenue_EUR']  = zeros
+            day_df._batt_soc_end        = battery_cfg.soc0
         return day_df
 
     opt_m2      = [value(model.P_M2[t])     for t in range(N)]
@@ -197,27 +246,45 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     opt_spill_b = [value(model.spill_b[t])  for t in range(N)]
     opt_spill_h = [value(model.spill_h[t])  for t in range(N)]
 
-    # attach_common_results sets a generic Opt_Energy_Trading_EUR — we override it below
     attach_common_results(
         day_df, opt_m2, opt_m1, opt_lb, opt_lh,
         opt_spill_b, opt_spill_h,
-        demand, da_price, target_lb, target_lh,
+        demand, target_lb, target_lh,
         mode_name='WATER_VALUE',
     )
 
-    # Correct pricing
     da_component = [
         (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
         for t in range(N)]
-    id_component = [
-        -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
-        for t in range(N)]
 
-    day_df['Opt_DA_Trading_EUR']   = da_component
-    day_df['Opt_ID_Imbalance_EUR'] = id_component
+    if with_batt:
+        batt_c   = [value(model.batt_c[t])   for t in range(N)]
+        batt_d   = [value(model.batt_d[t])   for t in range(N)]
+        batt_soc = [value(model.batt_SOC[t]) for t in range(N)]
+
+        grid_out = [opt_m2[t] + opt_m1[t] + batt_d[t] - batt_c[t] for t in range(N)]
+        id_component = [
+            -abs(grid_out[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+        id_hydro_only = [
+            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+
+        day_df['Batt_Charge_kW']    = batt_c
+        day_df['Batt_Discharge_kW'] = batt_d
+        day_df['Batt_SOC_kWh']      = batt_soc
+        day_df['Batt_Net_kW']       = [batt_d[t] - batt_c[t] for t in range(N)]
+        day_df['Batt_Revenue_EUR']  = [id_component[t] - id_hydro_only[t] for t in range(N)]
+        day_df._batt_soc_end        = value(model.batt_SOC[N])
+    else:
+        id_component = [
+            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            for t in range(N)]
+
+    day_df['Opt_DA_Trading_EUR']     = da_component
+    day_df['Opt_ID_Imbalance_EUR']   = id_component
     day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
-
-    day_df['Forecast_Drift_kW'] = [
+    day_df['Forecast_Drift_kW']      = [
         (opt_m2[t] + opt_m1[t]) - forecast[t] for t in range(N)]
 
     return day_df

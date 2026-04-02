@@ -106,10 +106,15 @@ def load_data(path: str) -> pd.DataFrame:
     df['Bidmi_mm']     = df['Bidmi_m']     * 1000
     df['Haselholz_mm'] = df['Haselholz_m'] * 1000
 
+    # Reference revenue evaluated on the same DA/ID pricing basis as all optimised modes.
+    # DA bid = Forecast (same bid submitted regardless of mode).
+    # ID cost = deviation of historical production from the forecast bid.
+    # This makes the gain purely a measure of dispatch quality improvement,
+    # independent of forecast accuracy.
     ref_prod = df['Ref_M2_kW'] + df['Ref_M1_kW']
-    df['Ref_Energy_Trading_EUR'] = (
-        (ref_prod - df['Consumption_kW']) * TIMESTEP_HOURS * df['Day_Ahead_Price_EUR_MWh'] / 1000
-    )
+    ref_da   = (df['Forecast_kW'] - df['Consumption_kW']) * TIMESTEP_HOURS * df['Day_Ahead_Price_EUR_MWh'] / 1000
+    ref_id   = -(ref_prod - df['Forecast_kW']).abs() * TIMESTEP_HOURS * df['Intra_Day_Price_EUR_MWh'] / 1000
+    df['Ref_Energy_Trading_EUR'] = ref_da + ref_id
     return df
 
 
@@ -133,6 +138,31 @@ def compute_seasonal_targets(df: pd.DataFrame) -> dict:
     return {
         dt.date(): (float(lb), float(lh))
         for dt, lb, lh in zip(t_lb.index, t_lb.values, t_lh.values)
+    }
+
+
+def compute_seasonal_production(df: pd.DataFrame) -> dict:
+    """30-day rolling average of reference production at each 5-min time slot.
+
+    Returns dict: date -> (avg_m2_array, avg_m1_array)
+    Each array has one value per 5-min slot in the day (288 entries for a full day).
+    """
+    df_c = df.copy()
+    df_c['date']     = df_c['DateTime'].dt.date
+    df_c['time_idx'] = df_c.groupby('date').cumcount()
+
+    pivot_m2 = df_c.pivot(index='date', columns='time_idx', values='Ref_M2_kW')
+    pivot_m1 = df_c.pivot(index='date', columns='time_idx', values='Ref_M1_kW')
+
+    avg_m2 = pivot_m2.rolling(ROLLING_WINDOW, center=True, min_periods=10).mean().bfill().ffill()
+    avg_m1 = pivot_m1.rolling(ROLLING_WINDOW, center=True, min_periods=10).mean().bfill().ffill()
+
+    avg_m2 = avg_m2.fillna(0.0).clip(lower=0.0, upper=P_MAX_M2)
+    avg_m1 = avg_m1.fillna(0.0).clip(lower=0.0, upper=P_MAX_M1)
+
+    return {
+        date: (avg_m2.loc[date].values.tolist(), avg_m1.loc[date].values.tolist())
+        for date in avg_m2.index
     }
 
 
@@ -191,8 +221,13 @@ def spill_to_kwh(spill_b_mm: list, spill_h_mm: list):
 
 def attach_common_results(day_df, opt_m2, opt_m1, opt_lb, opt_lh,
                           opt_spill_b, opt_spill_h,
-                          demand, price, target_lb, target_lh, mode_name):
-    """Add all standard Opt_* columns to day_df in-place. Returns day_df."""
+                          demand, target_lb, target_lh, mode_name):
+    """Add all standard Opt_* columns to day_df in-place.
+
+    NOTE: Opt_Energy_Trading_EUR is intentionally NOT set here.
+    Each mode (FORECAST, WATER_VALUE, WATER_LEVEL) writes its own
+    DA + ID formula immediately after calling this function.
+    """
     N     = len(day_df)
     opt_p = [opt_m2[t] + opt_m1[t] for t in range(N)]
 
@@ -204,9 +239,8 @@ def attach_common_results(day_df, opt_m2, opt_m1, opt_lb, opt_lh,
     day_df['Opt_Bidmi_mm']      = opt_lb
     day_df['Opt_Haselholz_mm']  = opt_lh
 
-    day_df['Opt_Energy_Trading_EUR'] = [
-        (opt_p[t] - demand[t]) * TIMESTEP_HOURS * price[t] / 1000.0
-        for t in range(N)]
+    # Opt_Energy_Trading_EUR is NOT set here — each mode computes its own
+    # DA+ID pricing formula and writes the column directly after this call.
 
     day_df['Opt_Target_Bidmi_mm']           = target_lb
     day_df['Opt_Target_Haselholz_mm']       = target_lh
