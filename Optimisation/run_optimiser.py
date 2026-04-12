@@ -28,7 +28,7 @@ from hydro_constants import (
 #   'WATER_VALUE'   LP that minimises intraday imbalance costs
 #   'WATER_LEVEL'   Follows historical reference (seasonal average) production
 #
-MODE = 'WATER_VALUE'
+MODE = 'FORECAST'
 
 # ---------------------------------------------------------------------------
 #  BATTERY SETTINGS
@@ -37,10 +37,10 @@ MODE = 'WATER_VALUE'
 #   BATTERY_ACTIVE  : True  — run battery dispatch after hydro each day
 #                     False — hydro only
 #   BATTERY_MODE    : 'DAY_AHEAD' — buy low / sell high on the DA market
-#                     'FORECAST'   — follow the same dispatch as hydro forecast (Correct the Forecast Errors)
+#                     'INTRADAY'   — reservoir-triggered co-simulation (reduces intraday imbalance)
 #
 BATTERY_ACTIVE = True
-BATTERY_MODE   = 'FORECAST'
+BATTERY_MODE   = 'INTRADAY'
 # ===========================================================================
 
 def _make_output_filename():
@@ -49,7 +49,7 @@ def _make_output_filename():
     if not BATTERY_ACTIVE:
         batt_str = 'NoBatt'
     else:
-        batt_short = {'DAY_AHEAD': 'DA', 'FORECAST': 'FCST'}.get(BATTERY_MODE, BATTERY_MODE)
+        batt_short = {'DAY_AHEAD': 'DA', 'INTRADAY': 'ID'}.get(BATTERY_MODE, BATTERY_MODE)
         mwh = int(round(CAPACITY_KWH / 1000))
         batt_str = f'{batt_short}_{mwh}MWh'
     return f'{mode_short}_{batt_str}.xlsx'
@@ -113,7 +113,7 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         lh0 = prev_lh if prev_lh is not None else float(day_df['Haselholz_mm'].iloc[0])
 
         # Build battery config for this day (carries today's starting SOC).
-        # FORECAST battery is co-simulated inside dispatch_day → passed as config.
+        # INTRADAY battery is co-simulated inside dispatch_day → passed as config.
         # DAY_AHEAD battery is fully independent → dispatch_day ignores it,
         #   dispatch_day_battery is called separately below.
         battery_cfg = (BatteryConfig(mode=BATTERY_MODE, soc0=prev_soc)
@@ -137,7 +137,7 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         # Battery post-dispatch
         batt_str = ""
         if BATTERY_ACTIVE:
-            if BATTERY_MODE == 'FORECAST':
+            if BATTERY_MODE == 'INTRADAY':
                 # Co-simulation already done inside dispatch_day.
                 # Just collect the results that were written to day_df.
                 prev_soc        = getattr(day_df, '_batt_soc_end', prev_soc)

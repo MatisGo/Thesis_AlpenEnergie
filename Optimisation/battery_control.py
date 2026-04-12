@@ -21,7 +21,7 @@ Modes
               Prices for the full day are known before dispatch → globally optimal.
               The battery is independent of the hydro plant.
 
-  FORECAST  : Rule-based causal controller triggered by reservoir fill levels.
+  INTRADAY  : Rule-based causal controller triggered by reservoir fill levels.
               Thresholds (90 % / 35 % of usable range) are checked each timestep
               using the reservoir levels produced by the hydro dispatch.
 
@@ -68,7 +68,7 @@ class BatteryConfig:
     """Immutable battery configuration passed into every dispatch_day function.
 
     mode : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
-           'FORECAST'  — reservoir-triggered co-simulation inside hydro dispatch.
+           'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
     soc0 : SOC at start of the day [kWh], carried from previous day.
 
     Pass None instead of a BatteryConfig to signal battery inactive.
@@ -80,7 +80,7 @@ class BatteryConfig:
 # Battery specifications
 # ---------------------------------------------------------------------------
 
-CAPACITY_KWH    = 500.0   # 0.5 MWh
+CAPACITY_KWH    = 100.0   # 0.5 MWh
 EFF_CHARGE      = math.sqrt(0.80)          
 EFF_DISCHARGE   = math.sqrt(0.80)          #
 ROUND_TRIP_EFF  = EFF_CHARGE * EFF_DISCHARGE  # = 0.80
@@ -170,7 +170,7 @@ def _build_da_model(N, da_price, soc0):
 
 
 # ---------------------------------------------------------------------------
-# FORECAST mode — per-step causal controller  (called inside hydro dispatch)
+# INTRADAY mode — per-step causal controller  (called inside hydro dispatch)
 # ---------------------------------------------------------------------------
 
 # Reservoir fill thresholds and battery power ratings
@@ -182,7 +182,7 @@ DISCHARGE_POWER_KW  = 400.0  # kW  (turbine produces this less when discharging)
 
 def battery_step_forecast(soc, fill_b, fill_h):
     """
-    Compute one 5-min timestep of the FORECAST battery controller.
+    Compute one 5-min timestep of the INTRADAY battery controller.
 
     Called at every timestep from inside the hydro dispatch loop so that
     the battery decision and the water-balance update share the same clock.
@@ -230,7 +230,7 @@ def dispatch_day_battery(day_df, soc0, solver, mode='DAY_AHEAD'):
               Intra_Day_Price_EUR_MWh, Opt_Production_kW, Forecast_kW)
     soc0    : starting SOC [kWh]
     solver  : Pyomo solver (from get_battery_solver()); unused for FORECAST mode
-    mode    : 'DAY_AHEAD' | 'FORECAST'
+    mode    : 'DAY_AHEAD' | 'INTRADAY'
 
     Returns
     -------
@@ -245,7 +245,7 @@ def dispatch_day_battery(day_df, soc0, solver, mode='DAY_AHEAD'):
     if mode != 'DAY_AHEAD':
         raise ValueError(
             f"dispatch_day_battery only handles 'DAY_AHEAD'. "
-            f"FORECAST battery is co-simulated inside the hydro dispatch loop.")
+            f"INTRADAY battery is co-simulated inside the hydro dispatch loop.")
 
     model  = _build_da_model(N, da_price, soc0)
     result = solver.solve(model, tee=False)

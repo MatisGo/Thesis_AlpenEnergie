@@ -59,7 +59,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
     Rule-based dispatch for one day.
 
     battery_cfg : BatteryConfig or None.
-      If mode == 'FORECAST', the battery is co-simulated at each timestep:
+      If mode == 'INTRADAY', the battery is co-simulated at each timestep:
         - battery_step_forecast() decides charge/discharge from current fill levels
         - turbine target adjusts so net grid export stays = Forecast
         - water balance uses the adjusted turbine output → levels are correct
@@ -72,7 +72,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
-    co_sim = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    co_sim = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
     soc    = battery_cfg.soc0 if co_sim else 0.0
 
     opt_m2, opt_m1           = [], []
@@ -94,7 +94,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
         norm_lb = (lb - BIDMI_LEVEL_MIN)     / BIDMI_RANGE
         norm_lh = (lh - HASELHOLZ_LEVEL_MIN) / HASELHOLZ_RANGE
 
-        # ── Battery co-simulation (FORECAST mode only) ────────────────────
+        # ── Battery co-simulation (INTRADAY mode only) ────────────────────
         # Decision is based on reservoir fill at START of this timestep.
         # Turbine target shifts so that grid export remains = Forecast.
         if co_sim:

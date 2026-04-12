@@ -14,7 +14,7 @@ Pricing (same structure as FORECAST and WATER_VALUE modes)
 
   ID component  = -|Grid_export - Forecast| × ID_price × dt / 1000  [EUR]
                   Absolute deviation from forecast always costs money.
-                  When battery FORECAST mode is active, grid export = turbine +
+                  When battery INTRADAY mode is active, grid export = turbine +
                   battery_net, so the battery can reduce the ID cost.
 """
 
@@ -31,7 +31,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
                  seasonal_prod=None, **_kwargs):
     """
     battery_cfg : BatteryConfig or None.
-      If mode == 'FORECAST', battery is co-simulated at each timestep
+      If mode == 'INTRADAY', battery is co-simulated at each timestep
       (same architecture as mode_forecast.py).
     """
     day_df   = day_df.reset_index(drop=True)
@@ -43,7 +43,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
-    co_sim = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    co_sim = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
     soc    = battery_cfg.soc0 if co_sim else 0.0
 
     opt_m2, opt_m1           = [], []

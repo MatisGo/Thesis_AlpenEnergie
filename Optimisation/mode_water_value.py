@@ -78,7 +78,7 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     Build the WATER_VALUE LP.
 
     battery_cfg : BatteryConfig or None.
-      When mode == 'FORECAST', battery variables (charge, discharge, SOC) are
+      When mode == 'INTRADAY', battery variables (charge, discharge, SOC) are
       added to the LP.  The imbalance constraint is written on the NET GRID
       export (turbine + battery_net) so the LP can use the battery to reduce
       ID costs.  The LP stays fully linear (no binary variables needed).
@@ -145,8 +145,8 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.dev_pos = Var(m.T, domain=NonNegativeReals)
     m.dev_neg = Var(m.T, domain=NonNegativeReals)
 
-    # Battery variables (FORECAST battery mode only)
-    with_battery = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    # Battery variables (INTRADAY battery mode only)
+    with_battery = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
     if with_battery:
         soc0_clamped = max(SOC_MIN, min(SOC_MAX, battery_cfg.soc0))
         m.batt_c   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
@@ -191,7 +191,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
                  solver=None, battery_cfg=None, **_kwargs):
     """
     battery_cfg : BatteryConfig or None.
-      'FORECAST' mode → battery vars added to LP; LP jointly minimises
+      'INTRADAY' mode → battery vars added to LP; LP jointly minimises
                         ID imbalance on net grid export (hydro + battery).
                         Battery columns and _batt_soc_end written to day_df.
       'DAY_AHEAD' mode or None → battery_cfg ignored here; handled separately.
@@ -204,7 +204,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     id_price    = day_df['Intra_Day_Price_EUR_MWh'].tolist()
     inflow_b    = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h    = day_df['Haselholz_Inflow_ls'].tolist()
-    with_batt   = battery_cfg is not None and battery_cfg.mode == 'FORECAST'
+    with_batt   = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
 
     model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
                           lb0, lh0, target_lb, target_lh,
