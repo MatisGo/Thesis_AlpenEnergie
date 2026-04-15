@@ -89,7 +89,7 @@ class BatteryConfig:
 # Battery specifications
 # ---------------------------------------------------------------------------
 
-CAPACITY_KWH    = 200.0   # 0.5 MWh
+CAPACITY_KWH    = 200.0   # 1 MWh
 EFF_CHARGE      = math.sqrt(0.80)          
 EFF_DISCHARGE   = math.sqrt(0.80)          
 ROUND_TRIP_EFF  = EFF_CHARGE * EFF_DISCHARGE  # = 0.80

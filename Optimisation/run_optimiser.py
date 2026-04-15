@@ -41,7 +41,7 @@ MODE = 'WATER_VALUE'
 #                     'HYBRID'    — INTRADAY + optional DA block when SOC > floor & price OK
 #
 BATTERY_ACTIVE = True
-BATTERY_MODE   = 'HYBRID'
+BATTERY_MODE   = 'INTRADAY'  # 'DAY_AHEAD', 'INTRADAY', 'HYBRID'
 
 # ---------------------------------------------------------------------------
 #  FINANCIAL PARAMETERS  (battery investment analysis)
@@ -55,7 +55,7 @@ BATTERY_MODE   = 'HYBRID'
 #   BATTERY_OM_EUR_KWH_YEAR: EUR/kWh/year — O&M cost per unit of installed capacity
 #                            e.g. 8.0 EUR/kWh/year → 8000 EUR/year for a 1000 kWh battery
 #
-BATTERY_COST_PER_KWH    = 500.0    # EUR/kWh
+BATTERY_COST_PER_KWH    = 300.0    # EUR/kWh
 BATTERY_LIFETIME_YEARS  =  15      # years
 DISCOUNT_RATE           = 0.05     # —
 BATTERY_DEG_PER_CYCLE   = 0.005    # fraction/cycle  (0.005 %/cycle)
@@ -185,7 +185,9 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
     prev_lb     = None
     prev_lh     = None
     failed_days = 0
-    da_block    = {}   # date → {'commit_kwh': float, 'peak_t': int}  (HYBRID only)
+    da_block             = {}    # date → {'commit_kwh': float, 'peak_t': int}  (HYBRID only)
+    total_da_delivery_kwh = 0.0  # kWh actually delivered via DA blocks
+    da_block_days         = 0    # number of days a DA block was executed
 
     for i, day in enumerate(days, 1):
         day_df = df[df['DateTime'].dt.date == day].copy()
@@ -246,9 +248,11 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
                     # 1. Apply any DA delivery committed from yesterday
                     block_today = da_block.get(day)
                     if block_today:
-                        extra_kwh       = _apply_da_delivery(
+                        extra_kwh              = _apply_da_delivery(
                             day_df, block_today['commit_kwh'], block_today['peak_t'])
-                        discharged_kwh += extra_kwh
+                        discharged_kwh        += extra_kwh
+                        total_da_delivery_kwh += extra_kwh
+                        da_block_days         += 1
                         # prev_soc = INTRADAY end (committed zone delivered, already excluded
                         # from INTRADAY dispatch via soc_max_override)
 
@@ -301,8 +305,10 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         results.append(day_df)
 
     result_df = pd.concat(results, ignore_index=True)
-    result_df._total_discharged_kwh = total_discharged_kwh
-    result_df._failed_days          = failed_days
+    result_df._total_discharged_kwh  = total_discharged_kwh
+    result_df._failed_days           = failed_days
+    result_df._da_delivery_kwh       = total_da_delivery_kwh
+    result_df._da_block_days         = da_block_days
     return result_df
 
 
@@ -356,6 +362,10 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         total_discharged  = getattr(opt_df, '_total_discharged_kwh', 0.0)
         total_cycles      = total_discharged / CYCLE_KWH
         total_charged_kwh = (opt_df['Batt_Charge_kW'] * TIMESTEP_HOURS).sum()
+        da_delivery_kwh   = getattr(opt_df, '_da_delivery_kwh', 0.0)
+        da_block_days     = getattr(opt_df, '_da_block_days',   0)
+        da_pct            = (da_delivery_kwh / total_discharged * 100
+                             if total_discharged > 0 else 0.0)
         # Financial analysis
         n_days            = opt_df['DateTime'].dt.date.nunique()
         batt_capex        = CAPACITY_KWH * BATTERY_COST_PER_KWH
@@ -393,6 +403,7 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
             ('Total discharged',      f'{total_discharged:,.1f}',      'kWh'),
             ('Total cycles',          f'{total_cycles:.1f}',           'cycles'),
             ('Battery revenue',       f'{total_batt_rev:+,.2f}',       'EUR'),
+            ('DA block days',         f'{da_block_days}  ({da_pct:.1f}% of discharge)',  'days'),
             ('', '', ''),
             ('--- Battery Investment ---', '', ''),
             ('Days simulated',        f'{n_days}',                                     'days'),
@@ -501,6 +512,8 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         'Payback_Years':       round(simple_payback, 1)    if (batt_rows and simple_payback < 100) else ('>100' if batt_rows else 0),
         'LCOS_EUR_kWh':        round(lcos, 3)              if (batt_rows and lcos < 9999) else 0,
         'Capacity_EOL_pct':    capacity_end_life           if batt_rows else 0,
+        'DA_Block_Days':        da_block_days           if batt_rows else '-',
+        'DA_Delivery_Pct':     round(da_pct, 1)        if batt_rows else '-',
         'Failed_Days':         getattr(opt_df, '_failed_days', 0),
         'Output_File':         os.path.basename(output_path),
     }
