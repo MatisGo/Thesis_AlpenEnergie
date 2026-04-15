@@ -13,7 +13,8 @@ Battery specifications
   SOC_MAX_PCT      : 0.90      — upper SOC limit (90 % of capacity = 5.4 kWh)
   SOC_INITIAL_PCT  : 0.10      — SOC at start of first day (10 % = 0.6 kWh)
   CYCLE_KWH        : 6 000 kWh  — energy discharged that counts as one full cycle (6 MWh)
-  (no power limit)
+  C_RATE           : 0.5 C      — inverter/hardware power limit (50 % of capacity per hour)
+  P_MAX_BATT       : C_RATE × CAPACITY_KWH  [kW]  — applies to LP bounds and rule-based controller
 
 Modes
 -----
@@ -25,13 +26,15 @@ Modes
               Thresholds (90 % / 35 % of usable range) are checked each timestep
               using the reservoir levels produced by the hydro dispatch.
 
-              Charge (300 kW) when either reservoir fill > 90 %:
-                Turbine produces Forecast + 300 kW — battery absorbs surplus,
+              Charge when either reservoir fill > 90 %:
+                Power scales from 0 (at threshold) to P_MAX_BATT (reservoir full),
+                capped by remaining SOC headroom.  Turbine produces Forecast + charge_kw,
                 grid sees Forecast.  Water is released faster (prevents spill).
 
-              Discharge (400 kW) when either reservoir fill < 35 %:
-                Turbine produces Forecast − 400 kW — battery covers the gap,
-                grid sees Forecast.  Water is saved (avoids running dry).
+              Discharge when either reservoir fill < 30 %:
+                Power scales from 0 (at threshold) to P_MAX_BATT (reservoir empty),
+                capped by available SOC above SOC_MIN.  Turbine produces Forecast − discharge_kw,
+                battery covers the gap, grid sees Forecast.  Water is saved (avoids running dry).
 
               Opt_Production_kW is updated to reflect the adjusted turbine output.
               Opt_Energy_Trading_EUR is recalculated on the actual grid output.
@@ -67,22 +70,28 @@ from hydro_constants import TIMESTEP_HOURS
 class BatteryConfig:
     """Immutable battery configuration passed into every dispatch_day function.
 
-    mode : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
-           'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
-    soc0 : SOC at start of the day [kWh], carried from previous day.
+    mode             : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
+                       'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
+                       'HYBRID'    — INTRADAY co-sim with optional DA block reservation.
+    soc0             : SOC at start of the day [kWh], carried from previous day.
+    soc_max_override : When set, replaces SOC_MAX for the INTRADAY controller.
+                       Used by HYBRID mode to cap the INTRADAY zone below the DA
+                       block floor, so committed energy stays reserved.
+                       None → use the global SOC_MAX.
 
     Pass None instead of a BatteryConfig to signal battery inactive.
     """
     mode: str
     soc0: float
+    soc_max_override: float = None
 
 # ---------------------------------------------------------------------------
 # Battery specifications
 # ---------------------------------------------------------------------------
 
-CAPACITY_KWH    = 100.0   # 0.5 MWh
+CAPACITY_KWH    = 200.0   # 0.5 MWh
 EFF_CHARGE      = math.sqrt(0.80)          
-EFF_DISCHARGE   = math.sqrt(0.80)          #
+EFF_DISCHARGE   = math.sqrt(0.80)          
 ROUND_TRIP_EFF  = EFF_CHARGE * EFF_DISCHARGE  # = 0.80
 
 SOC_MIN_PCT     = 0.10
@@ -95,12 +104,16 @@ SOC_MIN     = round(SOC_MIN_PCT     * CAPACITY_KWH, 6)   #   600.0 kWh
 SOC_MAX     = round(SOC_MAX_PCT     * CAPACITY_KWH, 6)   # 5 400.0 kWh
 SOC_INITIAL = round(SOC_INITIAL_PCT * CAPACITY_KWH, 6)   #   600.0 kWh
 
-CYCLE_KWH   = CAPACITY_KWH                               # 6 000.0 kWh = 1 cycle
+CYCLE_KWH   = CAPACITY_KWH                               # 1 full cycle = full usable capacity
 
-# Maximum charge/discharge power: full usable range in one timestep.
-# Explicit bounds help GLPK presolve; they don't restrict the solution space
-# since the SOC balance already limits power implicitly.
-_P_MAX_BATT = round((SOC_MAX - SOC_MIN) / TIMESTEP_HOURS, 3)  # kW
+# ---------------------------------------------------------------------------
+# C-rate — inverter / hardware power limit
+# ---------------------------------------------------------------------------
+# 0.5 C means the battery can charge or discharge at 50 % of its nominal
+# capacity per hour.  For a 200 kWh battery: P_max = 0.5 × 200 = 100 kW.
+# This value caps both the rule-based controller and the LP variable bounds.
+C_RATE      = 0.5                               # C  (change here to adjust power limit)
+_P_MAX_BATT = round(C_RATE * CAPACITY_KWH, 3)  # kW — used as LP upper bound
 
 
 # ---------------------------------------------------------------------------
@@ -173,28 +186,40 @@ def _build_da_model(N, da_price, soc0):
 # INTRADAY mode — per-step causal controller  (called inside hydro dispatch)
 # ---------------------------------------------------------------------------
 
-# Reservoir fill thresholds and battery power ratings
+# Reservoir fill thresholds that trigger battery action
 CHARGE_THRESHOLD    = 0.90   # charge when fill > 90 %
 DISCHARGE_THRESHOLD = 0.30   # discharge when fill < 30 %
-CHARGE_POWER_KW     = 300.0  # kW  (turbine produces this extra when charging)
-DISCHARGE_POWER_KW  = 400.0  # kW  (turbine produces this less when discharging)
+# Power is NOT fixed — it scales proportionally with how far the fill is from
+# the threshold, up to _P_MAX_BATT and capped by available SOC headroom.
 
 
-def battery_step_forecast(soc, fill_b, fill_h):
+def battery_step_forecast(soc, fill_b, fill_h, soc_max_eff=None):
     """
-    Compute one 5-min timestep of the INTRADAY battery controller.
+    Compute one 5-min timestep of the INTRADAY / HYBRID battery controller.
 
     Called at every timestep from inside the hydro dispatch loop so that
     the battery decision and the water-balance update share the same clock.
     No future information is used — only the current SOC and fill levels.
 
-    Priority: high fill (charge) beats low fill (discharge).
+    Power is proportional to the reservoir deviation from its threshold:
+
+      charge_urgency   = max(fill_b, fill_h) - CHARGE_THRESHOLD
+                         normalised to [0, 1] over [threshold → 1.0]
+      discharge_urgency = DISCHARGE_THRESHOLD - min(fill_b, fill_h)
+                          normalised to [0, 1] over [threshold → 0.0]
+
+      actual_power = urgency × _P_MAX_BATT, capped by available SOC headroom.
+
+    Priority: charging (high reservoir) beats discharging (low reservoir).
 
     Parameters
     ----------
-    soc    : current state of charge [kWh]  (start of timestep)
-    fill_b : Bidmi fill ratio     [0..1]
-    fill_h : Haselholz fill ratio [0..1]
+    soc         : current state of charge [kWh]  (start of timestep)
+    fill_b      : Bidmi fill ratio     [0..1]
+    fill_h      : Haselholz fill ratio [0..1]
+    soc_max_eff : effective SOC upper limit [kWh]; if None, uses global SOC_MAX.
+                  Set by HYBRID mode to DA_BLOCK_FLOOR_SOC so the INTRADAY
+                  controller cannot consume reserved DA energy.
 
     Returns
     -------
@@ -202,17 +227,31 @@ def battery_step_forecast(soc, fill_b, fill_h):
     discharge_kw : power pushed out of battery         [kW]
     soc_new      : SOC at end of timestep              [kWh]
     """
-    if fill_b > CHARGE_THRESHOLD or fill_h > CHARGE_THRESHOLD:
-        max_c = max(0.0, (SOC_MAX - soc) / (EFF_CHARGE * TIMESTEP_HOURS))
-        c, d  = min(CHARGE_POWER_KW, max_c), 0.0
-    elif fill_b < DISCHARGE_THRESHOLD or fill_h < DISCHARGE_THRESHOLD:
+    _soc_max = soc_max_eff if soc_max_eff is not None else SOC_MAX
+
+    # --- Charge urgency: worst (highest) reservoir above threshold ---
+    fill_excess = max(fill_b - CHARGE_THRESHOLD, fill_h - CHARGE_THRESHOLD, 0.0)
+    charge_urgency = min(fill_excess / (1.0 - CHARGE_THRESHOLD), 1.0)
+
+    # --- Discharge urgency: worst (lowest) reservoir below threshold ---
+    fill_deficit = max(DISCHARGE_THRESHOLD - fill_b, DISCHARGE_THRESHOLD - fill_h, 0.0)
+    discharge_urgency = min(fill_deficit / DISCHARGE_THRESHOLD, 1.0)
+
+    if charge_urgency > 0.0:
+        # Charge: proportional power, capped by SOC headroom
+        max_c = max(0.0, (_soc_max - soc) / (EFF_CHARGE * TIMESTEP_HOURS))
+        c = min(_P_MAX_BATT * charge_urgency, max_c)
+        d = 0.0
+    elif discharge_urgency > 0.0:
+        # Discharge: proportional power, capped by available SOC
         max_d = max(0.0, (soc - SOC_MIN) * EFF_DISCHARGE / TIMESTEP_HOURS)
-        c, d  = 0.0, min(DISCHARGE_POWER_KW, max_d)
+        d = min(_P_MAX_BATT * discharge_urgency, max_d)
+        c = 0.0
     else:
         c = d = 0.0
 
     soc_new = soc + c * EFF_CHARGE * TIMESTEP_HOURS - d / EFF_DISCHARGE * TIMESTEP_HOURS
-    soc_new = max(SOC_MIN, min(SOC_MAX, soc_new))
+    soc_new = max(SOC_MIN, min(_soc_max, soc_new))
     return c, d, soc_new
 
 

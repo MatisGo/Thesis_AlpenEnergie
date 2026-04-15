@@ -145,10 +145,14 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.dev_pos = Var(m.T, domain=NonNegativeReals)
     m.dev_neg = Var(m.T, domain=NonNegativeReals)
 
-    # Battery variables (INTRADAY battery mode only)
-    with_battery = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
+    # Battery variables (INTRADAY / HYBRID battery mode)
+    with_battery = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
     if with_battery:
-        soc0_clamped = max(SOC_MIN, min(SOC_MAX, battery_cfg.soc0))
+        # For HYBRID, soc_max_override caps the SOC ceiling to DA_BLOCK_FLOOR_SOC
+        # so the LP cannot consume the reserved DA energy.
+        soc_max_eff  = (battery_cfg.soc_max_override
+                        if battery_cfg.soc_max_override is not None else SOC_MAX)
+        soc0_clamped = max(SOC_MIN, min(soc_max_eff, battery_cfg.soc0))
         m.batt_c   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
         m.batt_d   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
         m.batt_SOC = Var(m.T_ext, domain=NonNegativeReals)
@@ -156,7 +160,7 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         m.batt_soc_lo = Constraint([t for t in T_ext if t >= 1],
                                    rule=lambda m, t: m.batt_SOC[t] >= SOC_MIN)
         m.batt_soc_hi = Constraint([t for t in T_ext if t >= 1],
-                                   rule=lambda m, t: m.batt_SOC[t] <= SOC_MAX)
+                                   rule=lambda m, t: m.batt_SOC[t] <= soc_max_eff)
         m.batt_soc_bal = Constraint(m.T, rule=lambda m, t:
             m.batt_SOC[t + 1] == m.batt_SOC[t]
                                + m.batt_c[t] * EFF_CHARGE    * TIMESTEP_HOURS
@@ -204,7 +208,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     id_price    = day_df['Intra_Day_Price_EUR_MWh'].tolist()
     inflow_b    = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h    = day_df['Haselholz_Inflow_ls'].tolist()
-    with_batt   = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
+    with_batt   = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
 
     model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
                           lb0, lh0, target_lb, target_lh,

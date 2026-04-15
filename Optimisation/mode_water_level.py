@@ -43,7 +43,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
-    co_sim = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
+    co_sim = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
     soc    = battery_cfg.soc0 if co_sim else 0.0
 
     opt_m2, opt_m1           = [], []
@@ -58,9 +58,12 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
         norm_lh = (lh - HASELHOLZ_LEVEL_MIN) / HASELHOLZ_RANGE
 
         # Battery co-simulation: decide before turbine runs, adjust target
+        # For HYBRID, soc_max_override caps INTRADAY zone below the DA block floor.
         if co_sim:
             batt_soc_list.append(soc)
-            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh)
+            soc_max_eff = battery_cfg.soc_max_override  # None → uses global SOC_MAX
+            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh,
+                                                         soc_max_eff=soc_max_eff)
         else:
             batt_c = batt_d = 0.0
         batt_c_list.append(batt_c)

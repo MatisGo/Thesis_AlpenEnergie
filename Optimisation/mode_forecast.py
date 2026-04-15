@@ -72,7 +72,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
-    co_sim = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
+    co_sim = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
     soc    = battery_cfg.soc0 if co_sim else 0.0
 
     opt_m2, opt_m1           = [], []
@@ -94,12 +94,16 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
         norm_lb = (lb - BIDMI_LEVEL_MIN)     / BIDMI_RANGE
         norm_lh = (lh - HASELHOLZ_LEVEL_MIN) / HASELHOLZ_RANGE
 
-        # ── Battery co-simulation (INTRADAY mode only) ────────────────────
+        # ── Battery co-simulation (INTRADAY / HYBRID mode) ───────────────
         # Decision is based on reservoir fill at START of this timestep.
         # Turbine target shifts so that grid export remains = Forecast.
+        # For HYBRID, soc_max_override caps the INTRADAY zone below the DA
+        # block floor so committed energy stays reserved.
         if co_sim:
             batt_soc_list.append(soc)
-            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh)
+            soc_max_eff = battery_cfg.soc_max_override  # None → uses global SOC_MAX
+            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh,
+                                                         soc_max_eff=soc_max_eff)
             turbine_target = forecast_kw + batt_c - batt_d
         else:
             batt_c = batt_d = 0.0
