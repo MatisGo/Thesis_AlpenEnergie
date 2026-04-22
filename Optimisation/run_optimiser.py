@@ -58,7 +58,7 @@ BATTERY_MODE   = 'INTRADAY'  # 'DAY_AHEAD', 'INTRADAY', 'HYBRID'
 BATTERY_COST_PER_KWH    = 300.0    # EUR/kWh
 BATTERY_LIFETIME_YEARS  =  15      # years
 DISCOUNT_RATE           = 0.05     # —
-BATTERY_DEG_PER_CYCLE   = 0.005    # fraction/cycle  (0.005 %/cycle)
+BATTERY_DEG_PER_CYCLE   = 0.00005    # fraction/cycle  (0.005 %/cycle)
 BATTERY_OM_EUR_KWH_YEAR = 8.0     # EUR/kWh/year (8 could be default)
 
 # ---------------------------------------------------------------------------

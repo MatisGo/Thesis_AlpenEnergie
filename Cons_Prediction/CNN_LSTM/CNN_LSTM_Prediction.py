@@ -21,7 +21,7 @@ Architecture (based on Chung & Jang 2022, Khan et al. 2020):
     - RepeatVector + LSTM decoder + TimeDistributed Dense
     - Outputs (48 hours, 12 steps each) then flattened to 576 steps
 
-Input 1 - Encoder (7-day lookback, 2016 steps x 11 features):
+Input 1 - Encoder (7-day lookback, 2016 steps x 12 features):
   Load_Is (past), Load_yesterday, Load_last_week,
   Hour_sin, Hour_cos, Weekday_sin, Weekday_cos,
   PHolyday, Temp_Forecast, Rain_Forecast,
@@ -61,7 +61,8 @@ from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import (Conv1D, MaxPooling1D, LSTM, Dense,
                                       Dropout, BatchNormalization, Input,
                                       RepeatVector, TimeDistributed, Reshape,
-                                      Flatten, Concatenate)
+                                      Flatten, Concatenate, Permute, Dot,
+                                      Multiply, Activation, Lambda)
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
@@ -105,7 +106,7 @@ INPUT_FEATURES = [
     'PHolyday',             # Public holiday flag (0/1)
     'Temp_Forecast',        # Temperature forecast (deg C)
     'Rain_Forecast',        # Rain forecast (mm)
-    'Irr_FC',                # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
+    'Irr_FC',               # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
     'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
 ]
 TARGET = 'Load_Is'
@@ -122,6 +123,9 @@ LSTM_UNITS = [128, 64]
 DENSE_UNITS = 256
 DROPOUT_RATE = 0.2
 
+# Week-level cross-attention (stat profiles)
+ATTN_DIM = 32          # Key/query projection dimension for the attention layer
+
 # Training
 LEARNING_RATE = 0.001
 EPOCHS        = 100
@@ -131,11 +135,11 @@ BATCH_SIZE = 32
 PATIENCE = 15
 
 # Statistical baseline
-HYBRID_N_PAST_WEEKS = 4        # Number of same-day-of-week weeks to look back
+HYBRID_N_PAST_WEEKS = 8        # Number of same-day-of-week weeks to look back
 HYBRID_AGG_METHOD = 'mean'     # 'mean' or 'median' for historical aggregation
 
 # Decoder conditioning (same-weekday statistical profiles as second model input)
-STAT_N_WEEKS = 4               # Number of past same-weekday profiles fed to decoder
+STAT_N_WEEKS = 8               # Number of past same-weekday profiles fed to decoder
 
 
 # =============================================================================
@@ -512,6 +516,7 @@ def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
     x = Dropout(DROPOUT_RATE)(x)
     x = LSTM(LSTM_UNITS[1], return_sequences=False)(x)
     x = Dropout(DROPOUT_RATE)(x)
+    encoder_out = x   # (batch, LSTM_UNITS[1]=64) — saved as attention Query source
 
     # --- Decoder: produce structured output (48 hours x 12 steps) ---
     # Encode context into dense vector, repeat for each output hour
@@ -519,11 +524,42 @@ def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
     x = Dropout(DROPOUT_RATE)(x)
     x = RepeatVector(output_hours)(x)  # (batch, 48, 256)
 
-    # --- Process statistical profiles (Input 2) ---
-    # Reshape (576, n_weeks) → (48, 12 * n_weeks) to match hourly decoder blocks
+    # --- Week-level cross-attention over statistical profiles (Input 2) ---
+    #
+    # Instead of treating all 4 past same-weekday profiles equally, we let the
+    # encoder context decide which week is most relevant for the current forecast.
+    #
+    # Mechanism (scaled dot-product, Vaswani et al. 2017):
+    #   Query  : encoder LSTM output          (batch, LSTM_UNITS[1])
+    #   Keys   : one compact vector per week  (batch, n_weeks, ATTN_DIM)
+    #   Values : the raw per-step profiles    (batch, 576, n_weeks)
+    #   Output : weighted sum of profiles     (batch, 576, 1) → (batch, 48, 12)
+    #
     n_weeks = stat_shape[1]
-    stat = Reshape((output_hours, steps_per_hour * n_weeks))(stat_input)  # (batch, 48, 48)
-    stat = TimeDistributed(Dense(32, activation='relu'))(stat)            # (batch, 48, 32)
+
+    # Project each week's full 576-step profile to a compact key vector
+    stat_weeks = Permute((2, 1))(stat_input)                                         # (batch, n_weeks, 576)
+    week_keys  = Dense(ATTN_DIM, use_bias=False, name='attn_week_key')(stat_weeks)   # (batch, n_weeks, ATTN_DIM)
+
+    # Project encoder context to query space
+    query_proj = Dense(ATTN_DIM, use_bias=False, name='attn_query')(encoder_out)     # (batch, ATTN_DIM)
+    query_3d   = Reshape((1, ATTN_DIM))(query_proj)                                  # (batch, 1, ATTN_DIM)
+
+    # Scaled dot-product scores: query · keysᵀ / √d
+    scores  = Dot(axes=[2, 2], name='attn_scores')([query_3d, week_keys])            # (batch, 1, n_weeks)
+    scores  = Flatten()(scores)                                                       # (batch, n_weeks)
+    scores  = Lambda(lambda s: s / tf.math.sqrt(float(ATTN_DIM)),
+                     name='attn_scale')(scores)                                       # (batch, n_weeks)
+    attn_w  = Activation('softmax', name='week_attention')(scores)                   # (batch, n_weeks)
+
+    # Weighted sum of the n_weeks profiles → single attended profile
+    # stat_input (batch, 576, n_weeks) @ attn_w_col (batch, n_weeks, 1) → (batch, 576, 1)
+    attn_w_col  = Reshape((n_weeks, 1))(attn_w)                                      # (batch, n_weeks, 1)
+    attended    = Dot(axes=[2, 1], name='attn_weighted_sum')([stat_input, attn_w_col])# (batch, 576, 1)
+
+    # Reshape to hourly blocks then project to 32-dim — same output shape as before
+    stat = Reshape((output_hours, steps_per_hour), name='stat_reshape')(attended)    # (batch, 48, 12)
+    stat = TimeDistributed(Dense(32, activation='relu'), name='stat_proj')(stat)     # (batch, 48, 32)
 
     # --- Process PV estimate (Input 3) ---
     # Reshape (576, 1) → (48, 12) hourly blocks, then compress to 8-dim

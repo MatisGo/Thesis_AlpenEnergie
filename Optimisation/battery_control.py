@@ -89,7 +89,7 @@ class BatteryConfig:
 # Battery specifications
 # ---------------------------------------------------------------------------
 
-CAPACITY_KWH    = 200.0   # 1 MWh
+CAPACITY_KWH    = 200   # 1 MWh
 EFF_CHARGE      = math.sqrt(0.80)          
 EFF_DISCHARGE   = math.sqrt(0.80)          
 ROUND_TRIP_EFF  = EFF_CHARGE * EFF_DISCHARGE  # = 0.80
@@ -112,7 +112,7 @@ CYCLE_KWH   = CAPACITY_KWH                               # 1 full cycle = full u
 # 0.5 C means the battery can charge or discharge at 50 % of its nominal
 # capacity per hour.  For a 200 kWh battery: P_max = 0.5 × 200 = 100 kW.
 # This value caps both the rule-based controller and the LP variable bounds.
-C_RATE      = 0.5                               # C  (change here to adjust power limit)
+C_RATE      = 1                               # C  (change here to adjust power limit)
 _P_MAX_BATT = round(C_RATE * CAPACITY_KWH, 3)  # kW — used as LP upper bound
 
 

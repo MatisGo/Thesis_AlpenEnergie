@@ -1,0 +1,1581 @@
+"""
+CNN-LSTM 48h Load Prediction — Meiringen Weather Source
+========================================================
+Variant of CNN_LSTM_Prediction.py that uses Meiringen_formatted.xlsx
+(produced by reformat_temp.py from the Meteomatics Meiringen.csv) as the
+weather input instead of the Open-Meteo Imported_Forecast.xlsx.
+
+Purpose: compare model accuracy between the two weather data sources
+without touching the original Open-Meteo model.
+
+Weather mapping (Meiringen → model features):
+  Global Radiation  [W]   → Irr_FC        (irradiance for encoder + PV estimate)
+  Temperature       [°C]  → Temp_Forecast
+  Precipitation     [mm]  → Rain_Forecast
+  Cloud Cover       [%]   → Cloud_Cover
+
+Timestamps in Meiringen_formatted.xlsx are UTC; they are automatically
+converted to Europe/Zurich local time to match Data_Prediction.xlsx.
+The raw Meiringen data is irregular (~15-min); it is resampled to a
+regular 5-min grid via linear time interpolation before merging.
+
+Models are saved with a '_meiringen' suffix so they never overwrite
+the Open-Meteo trained models:
+  CNN_LSTM_Model_48h_meiringen.keras
+  CNN_LSTM_Config_48h_meiringen.npz
+
+Architecture and all hyperparameters are identical to CNN_LSTM_Prediction.py.
+
+Usage:
+  python CNN_LSTM_Meiringen.py --train
+  python CNN_LSTM_Meiringen.py --predict 2026-02-15
+"""
+
+import argparse
+import os
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import warnings
+warnings.filterwarnings('ignore')
+
+import tensorflow as tf
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import (Conv1D, MaxPooling1D, LSTM, Dense,
+                                      Dropout, BatchNormalization, Input,
+                                      RepeatVector, TimeDistributed, Reshape,
+                                      Flatten, Concatenate, Permute, Dot,
+                                      Multiply, Activation, Lambda)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR     = os.path.join(SCRIPT_DIR, '..', 'Output Forecast')
+DATA_PATH       = os.path.join(SCRIPT_DIR, 'Ressource', 'Data_Prediction.xlsx')
+MEIRINGEN_PATH  = os.path.join(SCRIPT_DIR, 'Ressource', 'Meiringen_formatted.xlsx')
+PV_TABLE_PATH   = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_Correction_Table.npz')
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Output horizon — single source of truth. Only OUTPUT_HOURS is edited directly.
+OUTPUT_HOURS     = 48   # Default forecast horizon in hours (48h Mon-Thu, 96h Fri-Sun)
+STEPS_PER_HOUR   = 12   # 5-min resolution: 60/5 = 12 steps per hour
+FORECAST_HORIZON = OUTPUT_HOURS * STEPS_PER_HOUR   # derived — do not edit directly
+
+# Model/config paths — '_meiringen' suffix avoids overwriting the Open-Meteo models
+MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{OUTPUT_HOURS}h_meiringen.keras')
+CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{OUTPUT_HOURS}h_meiringen.npz')
+
+# Data parameters
+LOOKBACK_STEPS = 2016       # 7 days * 288 steps/day (5-min resolution)
+STEP_SIZE = 6               # Sample every 30 min (reduces memory, keeps enough samples)
+METADATA_ROWS = 2           # Rows to skip in xlsx (Einheit, Signalname)
+TEST_DAYS = 10              # Last N days held out for testing
+
+# Input features (order matters - must match during prediction)
+INPUT_FEATURES = [
+    'Load_Is',              # Past load values (net load = gross - PV)
+    'Load_yesterday',       # Load at same time 24h ago (lagged feature)
+    'Load_last_week',       # Load at same time 7 days ago (lagged feature)
+    'Hour_sin',             # Time of day (sin component)
+    'Hour_cos',             # Time of day (cos component)
+    'Weekday_sin',          # Day of week (sin component)
+    'Weekday_cos',          # Day of week (cos component)
+    'PHolyday',             # Public holiday flag (0/1)
+    'Temp_Forecast',        # Temperature forecast (deg C)
+    'Rain_Forecast',        # Rain forecast (mm)
+    'Irr_FC',                # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
+    'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
+]
+TARGET = 'Load_Is'
+
+# CNN architecture
+CNN_FILTERS = [64, 128, 256]
+CNN_KERNELS = [5, 5, 3]
+POOL_SIZES = [4, 4, 2]     # 2016 → 504 → 126 → 63
+
+# LSTM architecture
+LSTM_UNITS = [128, 64]
+
+# Dense output
+DENSE_UNITS = 256
+DROPOUT_RATE = 0.2
+
+# Week-level cross-attention (stat profiles)
+ATTN_DIM = 32          # Key/query projection dimension for the attention layer
+
+# Training
+LEARNING_RATE = 0.001
+EPOCHS        = 100
+VAL_RATIO     = 0.15   # Fraction of training samples randomly drawn for validation
+
+BATCH_SIZE = 32
+PATIENCE = 15
+
+# Statistical baseline
+HYBRID_N_PAST_WEEKS = 4        # Number of same-day-of-week weeks to look back
+HYBRID_AGG_METHOD = 'mean'     # 'mean' or 'median' for historical aggregation
+
+# Decoder conditioning (same-weekday statistical profiles as second model input)
+STAT_N_WEEKS = 4               # Number of past same-weekday profiles fed to decoder
+
+
+# =============================================================================
+# PV CORRECTION TABLE
+# =============================================================================
+
+def load_pv_correction_table():
+    """
+    Load the pre-computed irradiance-to-PV correction table.
+
+    The table was built by Build_PV_Correction_Table.py from 2 years of
+    measured PV production and co-located irradiance forecast data,
+    following the Lorenz (2011) / Bacher (2009) approach.
+
+    Returns
+    -------
+    ratio_table : np.ndarray, shape (12, 96)
+        ratio_table[month-1, slot] = kW per (W/m²)
+        where slot is the 15-min slot index (0 = 00:00, 95 = 23:45).
+        Returns None if the file does not exist (PV feature disabled).
+    """
+    if not os.path.exists(PV_TABLE_PATH):
+        print(f"WARNING: PV correction table not found at {PV_TABLE_PATH}")
+        print("  Run Build_PV_Correction_Table.py first to enable PV conditioning.")
+        print("  Training will proceed WITHOUT PV input (Irr_FC still in encoder).")
+        return None
+
+    data = np.load(PV_TABLE_PATH)
+    ratio_table = data['ratio_table'].astype(np.float32)  # (12, 96)
+    print(f"  PV correction table loaded: shape={ratio_table.shape}, "
+          f"max_ratio={ratio_table.max():.4f}")
+    return ratio_table
+
+
+# =============================================================================
+# DATA LOADING & PREPROCESSING
+# =============================================================================
+
+def _load_meiringen_weather(path: str) -> pd.DataFrame:
+    """
+    Load Meiringen_formatted.xlsx (produced by reformat_temp.py).
+
+    The file has 3 header rows (display names / units / signal names) followed
+    by data rows with Date (DD.MM.YYYY) and Hour (HH:MM) columns.
+    Timestamps are stored in UTC; they are converted to Europe/Zurich local
+    time to align with the naive local timestamps in Data_Prediction.xlsx.
+
+    The raw data is irregular (~15-min); it is resampled onto a regular
+    5-min grid via linear time interpolation so it merges cleanly with the
+    5-min load data.
+
+    Returns DataFrame with columns:
+        [DateTime, Temperature_C, Irradiance_Wm2, Rain_Sum_mm, Cloud_Cover_Pct]
+    """
+    # Row 0 = display names (header), rows 1-2 = units/signals (skip)
+    df_w = pd.read_excel(path, sheet_name='Meiringen', header=0, skiprows=[1, 2])
+
+    # Build UTC datetime from Date + Hour columns
+    dt_utc = pd.to_datetime(
+        df_w['Date'].astype(str) + ' ' + df_w['Hour'].astype(str),
+        format='%d.%m.%Y %H:%M',
+        errors='coerce',
+        utc=True,
+    )
+    # Convert UTC → Europe/Zurich local time, then strip timezone to stay naive
+    # (matches the naive local timestamps in Data_Prediction.xlsx)
+    df_w['DateTime'] = dt_utc.dt.tz_convert('Europe/Zurich').dt.tz_localize(None)
+
+    df_w = df_w.dropna(subset=['DateTime']).sort_values('DateTime').set_index('DateTime')
+
+    # Map Meiringen columns to standard weather feature names (numeric only from here on)
+    weather_cols = ['Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm', 'Cloud_Cover_Pct']
+    df_w['Temperature_C']   = pd.to_numeric(df_w['Temperature'],      errors='coerce')
+    df_w['Irradiance_Wm2']  = pd.to_numeric(df_w['Global Radiation'], errors='coerce').clip(lower=0)
+    df_w['Rain_Sum_mm']     = pd.to_numeric(df_w['Precipitation'],     errors='coerce').fillna(0.0)
+    df_w['Cloud_Cover_Pct'] = pd.to_numeric(df_w['Cloud Cover'],       errors='coerce').clip(0, 100).fillna(50.0)
+
+    # Keep only numeric weather columns before deduplication so groupby.mean()
+    # doesn't choke on the leftover 'Date' and 'Hour' string columns.
+    # DST clock-back creates duplicate local timestamps; average them.
+    df_w = df_w[weather_cols].groupby(level=0).mean()
+
+    # Resample to a regular 5-min grid via linear time interpolation
+    full_index = pd.date_range(
+        start=df_w.index.min().floor('5min'),
+        end=df_w.index.max().ceil('5min'),
+        freq='5min',
+    )
+    df_5min = df_w[weather_cols].reindex(full_index)
+    df_5min = df_5min.interpolate(method='time').bfill().ffill()
+
+    # Re-clip after interpolation (safety: irradiance must stay ≥ 0)
+    df_5min['Irradiance_Wm2']  = df_5min['Irradiance_Wm2'].clip(lower=0)
+    df_5min['Cloud_Cover_Pct'] = df_5min['Cloud_Cover_Pct'].clip(0, 100)
+
+    df_5min = df_5min.reset_index().rename(columns={'index': 'DateTime'})
+
+    print(f"  Meiringen weather loaded: {len(df_5min):,} rows @ 5-min  "
+          f"({df_5min['DateTime'].min()} → {df_5min['DateTime'].max()})")
+
+    return df_5min[['DateTime', 'Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm', 'Cloud_Cover_Pct']]
+
+
+def load_data(ratio_table=None):
+    """
+    Load and preprocess data from two sources:
+      1. Data_Prediction.xlsx     — historical load, real sensor values (Irr_Real),
+                                    Forecast_Load (graph only), calendar features.
+      2. Meiringen_formatted.xlsx — local station weather (resampled to 5-min):
+                                    Temperature, Global Radiation (Irr_FC), Rain, Cloud Cover.
+                                    Historical only — no future forecast rows.
+
+    Merge strategy (outer join on DateTime):
+      - Irr_Real      → real sensor 'Irradiance Meiringen' from Data_Prediction (kept for reference)
+      - Temp_Forecast → Temperature_C from Meiringen (replaces old forecast column)
+      - Rain_Forecast → Rain_Sum_mm from Meiringen (replaces old forecast column)
+      - Irr_FC        → Global Radiation from Meiringen (used for encoder feature and PV_Est)
+      - Cloud_Cover   → Cloud Cover % from Meiringen
+      - Note: no future rows are added (Meiringen is historical only).
+
+    Also computes PV_Est = Irr_FC × ratio_table[month, slot] if table is provided.
+    """
+    # -------------------------------------------------------------------------
+    # 1. Load Data_Prediction.xlsx (historical: load, real sensors, calendar)
+    # -------------------------------------------------------------------------
+    print("Loading main data from:", DATA_PATH)
+    df = pd.read_excel(DATA_PATH, header=0)
+    df = df.iloc[METADATA_ROWS:].reset_index(drop=True)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Parse datetime from Date (col B) + Day_Time (col C)
+    date_part = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
+    time_part = pd.to_timedelta(df['Day_Time'].astype(str), errors='coerce')
+    df['DateTime'] = date_part + time_part
+
+    # Numeric columns from main file
+    for col in ['Load_Is', 'Forecast_Load', 'Weekday', 'PHolyday']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Real irradiance sensor (kept from Data_Prediction — not replaced by API)
+    irr_real_col = 'Irradiance Meiringen'
+    if irr_real_col in df.columns:
+        df['Irr_Real'] = pd.to_numeric(df[irr_real_col], errors='coerce').clip(lower=0)
+    else:
+        print(f"  WARNING: '{irr_real_col}' not found — Irr_Real set to 0")
+        df['Irr_Real'] = 0.0
+
+    df = df.dropna(subset=['DateTime']).sort_values('DateTime').reset_index(drop=True)
+
+    # -------------------------------------------------------------------------
+    # 2. Load Meiringen_formatted.xlsx (local station: Temperature, GHI, Rain)
+    # -------------------------------------------------------------------------
+    if os.path.exists(MEIRINGEN_PATH):
+        print("Loading Meiringen weather data from:", MEIRINGEN_PATH)
+        df_w = _load_meiringen_weather(MEIRINGEN_PATH)
+
+        # Outer merge: keeps all rows from both sources.
+        # Note: Meiringen data is historical only (no future forecast rows).
+        df = df.merge(df_w, on='DateTime', how='outer').sort_values('DateTime').reset_index(drop=True)
+        print(f"  Meiringen merge: {len(df_w):,} rows merged — "
+              f"future rows added: {(df['Load_Is'].isna() & df['Temperature_C'].notna()).sum()}")
+    else:
+        print(f"  WARNING: '{MEIRINGEN_PATH}' not found.")
+        print("  Run reformat_temp.py first to generate Meiringen_formatted.xlsx.")
+        print("  Falling back to Data_Prediction weather columns.")
+        df['Temperature_C']  = pd.to_numeric(df.get('Temp_Forecast',  0), errors='coerce')
+        df['Irradiance_Wm2'] = pd.to_numeric(df.get('Irradiance Forecast', 0), errors='coerce').clip(lower=0)
+        df['Rain_Sum_mm']    = pd.to_numeric(df.get('Rain_Forecast',  0), errors='coerce').fillna(0)
+
+    # -------------------------------------------------------------------------
+    # 3. Compute / fill calendar features for ALL rows (incl. future API rows)
+    # -------------------------------------------------------------------------
+    # Hour cyclical encoding — computed from DateTime directly (always valid)
+    df['HourFrac'] = df['DateTime'].dt.hour + df['DateTime'].dt.minute / 60.0
+    df['Hour_sin'] = np.sin(2 * np.pi * df['HourFrac'] / 24)
+    df['Hour_cos'] = np.cos(2 * np.pi * df['HourFrac'] / 24)
+
+    # Weekday: fill NaN (future rows have no Weekday from Data_Prediction)
+    df['Weekday'] = df['Weekday'].fillna(df['DateTime'].dt.weekday.astype(float))
+    df['Weekday_sin'] = np.sin(2 * np.pi * df['Weekday'] / 7)
+    df['Weekday_cos'] = np.cos(2 * np.pi * df['Weekday'] / 7)
+
+    # PHolyday: default 0 for future rows (unknown)
+    df['PHolyday'] = df['PHolyday'].fillna(0)
+
+    # -------------------------------------------------------------------------
+    # 4. Map API weather columns → model feature names
+    # -------------------------------------------------------------------------
+    # Temp_Forecast: API temperature (replaces old 'Temp_Forecast' from Data_Prediction)
+    df['Temp_Forecast'] = df['Temperature_C'].fillna(
+        pd.to_numeric(df.get('Temp_Forecast', pd.Series(dtype=float)), errors='coerce'))
+
+    # Rain_Forecast: API daily rain sum (replaces old 'Rain_Forecast')
+    df['Rain_Forecast'] = df['Rain_Sum_mm'].fillna(0.0)
+
+    # Irr_FC: API irradiance forecast (replaces old 'Irradiance Forecast')
+    df['Irr_FC'] = df['Irradiance_Wm2'].fillna(0.0).clip(lower=0)
+
+    # Cloud_Cover: total cloud cover % from API (50% neutral fallback)
+    df['Cloud_Cover'] = df['Cloud_Cover_Pct'].fillna(50.0).clip(0, 100) \
+        if 'Cloud_Cover_Pct' in df.columns else 50.0
+
+    # Irr_Real: real sensor from Data_Prediction for historical rows
+    # For future rows (no sensor), use API irradiance as proxy
+    df['Irr_Real'] = df['Irr_Real'].fillna(df['Irradiance_Wm2']).fillna(0.0).clip(lower=0)
+
+    # -------------------------------------------------------------------------
+    # 5. Interpolate continuous features and compute lagged load
+    # -------------------------------------------------------------------------
+    for col in ['Temp_Forecast', 'Rain_Forecast']:
+        df[col] = df[col].interpolate(method='linear').bfill().ffill()
+
+    # Load_Is: only interpolate within historical region (not into future NaN)
+    df['Load_Is'] = df['Load_Is'].interpolate(method='linear', limit_direction='both',
+                                               limit_area='inside')
+
+    df['Load_yesterday'] = df['Load_Is'].shift(288).bfill()
+    df['Load_last_week'] = df['Load_Is'].shift(2016).bfill()
+
+    # -------------------------------------------------------------------------
+    # 6. PV estimate via Lorenz (2011) correction table
+    # -------------------------------------------------------------------------
+    if ratio_table is not None:
+        months = df['DateTime'].dt.month.values - 1
+        slots  = (df['DateTime'].dt.hour * 4 +
+                  df['DateTime'].dt.minute // 15).values
+        slots  = np.clip(slots, 0, 95)
+        ratio_per_step = ratio_table[months, slots]
+        df['PV_Est'] = (df['Irr_FC'].values * ratio_per_step).astype(np.float32)
+    else:
+        df['PV_Est'] = 0.0
+
+    print(f"  Total rows     : {len(df)}")
+    print(f"  Date range     : {df['DateTime'].min()} to {df['DateTime'].max()}")
+    print(f"  Rows with Load : {df['Load_Is'].notna().sum()}")
+    print(f"  Future rows    : {df['Load_Is'].isna().sum()}")
+    print(f"  PV_Est range   : [{df['PV_Est'].min():.1f}, {df['PV_Est'].max():.1f}] kW")
+
+    return df
+
+
+# =============================================================================
+# SEQUENCE CREATION
+# =============================================================================
+
+def create_sequences(df, step=STEP_SIZE):
+    """
+    Create sliding-window input/output sequences.
+
+    Each sample:
+      X       = 7 days of features BEFORE the prediction point
+      y       = 48 hours of Load_Is AFTER the prediction point
+      pv_horiz= PV_Est for the 48-hour forecast window (decoder input 3)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Preprocessed data (must have INPUT_FEATURES, TARGET, DateTime,
+        Forecast_Load, PV_Est).
+    step : int
+        Sliding window step size (in 5-min increments).
+
+    Returns
+    -------
+    X, y, timestamps, forecast_loads, start_indices, pv_horizons : np.ndarray
+    """
+    features = df[INPUT_FEATURES].values
+    targets = df[TARGET].values
+    timestamps = df['DateTime'].values
+    forecast_loads = pd.to_numeric(df['Forecast_Load'], errors='coerce').values
+    pv_est_values = df['PV_Est'].values.astype(np.float32)
+
+    X, y, ts, fc, idx_list, pv_list = [], [], [], [], [], []
+
+    for i in range(LOOKBACK_STEPS, len(df) - FORECAST_HORIZON + 1, step):
+        target_slice = targets[i:i + FORECAST_HORIZON]
+        input_slice = features[i - LOOKBACK_STEPS:i]
+
+        # Skip samples with NaN in input or target
+        if np.isnan(target_slice).any() or np.isnan(input_slice).any():
+            continue
+
+        X.append(input_slice)
+        y.append(target_slice)
+        ts.append(timestamps[i])
+        fc.append(forecast_loads[i:i + FORECAST_HORIZON])
+        idx_list.append(i)  # forecast start index (for stat profiles)
+        pv_list.append(pv_est_values[i:i + FORECAST_HORIZON])
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
+    ts = np.array(ts)
+    fc = np.array(fc, dtype=np.float32)
+    start_indices = np.array(idx_list, dtype=np.int64)
+    pv_horizons = np.array(pv_list, dtype=np.float32)  # (N, 576)
+
+    print(f"  Created {len(X)} sequences")
+    print(f"  X shape: {X.shape}  (samples, lookback, features)")
+    print(f"  y shape: {y.shape}  (samples, forecast_horizon)")
+    print(f"  PV horizons shape: {pv_horizons.shape}")
+
+    return X, y, ts, fc, start_indices, pv_horizons
+
+
+# =============================================================================
+# STATISTICAL PROFILES FOR DECODER CONDITIONING
+# =============================================================================
+
+def build_stat_profiles(load_values, start_indices, horizon=None,
+                        n_weeks=STAT_N_WEEKS):
+    """
+    Build same-weekday statistical profiles for the forecast horizon.
+
+    For each sample starting at index i, extract the Load_Is values from
+    N past same-weekdays (1w, 2w, 3w, 4w ago) over the forecast window.
+    This gives the decoder direct visibility into weekly recurring patterns.
+
+    Parameters
+    ----------
+    load_values : np.ndarray
+        Full Load_Is column from the dataset.
+    start_indices : np.ndarray of int
+        Forecast start index for each sample (same as in create_sequences).
+    horizon : int
+        Forecast horizon in steps (576).
+    n_weeks : int
+        Number of past same-weekday profiles to include.
+
+    Returns
+    -------
+    profiles : np.ndarray, shape (n_samples, horizon, n_weeks)
+        Load values from past same-weekdays for each forecast step.
+    """
+    if horizon is None:
+        horizon = FORECAST_HORIZON   # read global at call time, not at definition time
+    n = len(start_indices)
+    profiles = np.full((n, horizon, n_weeks), np.nan, dtype=np.float32)
+
+    for w in range(1, n_weeks + 1):
+        shift = w * 2016  # w weeks back at 5-min resolution
+        for s, i in enumerate(start_indices):
+            src_start = i - shift
+            src_end = src_start + horizon
+            if src_start >= 0 and src_end <= len(load_values):
+                profiles[s, :, w - 1] = load_values[src_start:src_end]
+            elif src_start >= 0:
+                valid_len = min(len(load_values) - src_start, horizon)
+                profiles[s, :valid_len, w - 1] = load_values[src_start:src_start + valid_len]
+
+    # Fill NaN: for each sample/step, use the mean of available weeks
+    for s in range(n):
+        for j in range(horizon):
+            row = profiles[s, j, :]
+            available = row[np.isfinite(row)]
+            if len(available) > 0 and np.isnan(row).any():
+                profiles[s, j, np.isnan(row)] = available.mean()
+            elif len(available) == 0:
+                # No history at all → use nearest valid value in same sample
+                profiles[s, j, :] = 0.0  # will be rare; scaler handles it
+
+    return profiles
+
+
+# =============================================================================
+# MODEL ARCHITECTURE
+# =============================================================================
+
+def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
+                steps_per_hour=None):
+    """
+    Build CNN-LSTM model with triple decoder conditioning.
+
+    Triple-input architecture:
+      Input 1 (encoder): 7-day lookback features → CNN → LSTM → encoded context
+      Input 2 (decoder cond.): Same-weekday load profiles for forecast horizon
+      Input 3 (PV estimate): PV_Est for forecast horizon (Lorenz 2011 approach)
+
+    The decoder receives the encoded context, the weekly load pattern, AND
+    the estimated PV production, allowing it to predict the midday net-load
+    dip caused by local solar generation (the "duck curve" effect).
+
+    Parameters
+    ----------
+    input_shape : tuple
+        Encoder input: (timesteps, features) = (2016, 11)
+    stat_shape : tuple
+        Statistical profile: (forecast_horizon, n_weeks) = (576, 4)
+    pv_shape : tuple
+        PV estimate: (forecast_horizon, 1) = (576, 1)
+    output_hours : int
+        Number of hourly blocks = 48
+    steps_per_hour : int
+        5-min steps per hour = 12
+
+    Returns
+    -------
+    model : keras.Model
+    """
+    if output_hours is None:
+        output_hours = OUTPUT_HOURS        # read live global
+    if steps_per_hour is None:
+        steps_per_hour = STEPS_PER_HOUR   # read live global
+
+    # --- Three inputs ---
+    encoder_input = Input(shape=input_shape, name='encoder_input')
+    stat_input    = Input(shape=stat_shape,  name='stat_input')
+    pv_input      = Input(shape=pv_shape,    name='pv_input')
+
+    # --- CNN Encoder (3 blocks: 2016 -> 504 -> 126 -> 63) ---
+    x = encoder_input
+    for filters, kernel, pool in zip(CNN_FILTERS, CNN_KERNELS, POOL_SIZES):
+        x = Conv1D(filters, kernel, activation='relu', padding='same')(x)
+        x = BatchNormalization()(x)
+        x = MaxPooling1D(pool_size=pool)(x)
+        x = Dropout(DROPOUT_RATE)(x)
+
+    # --- LSTM Encoder ---
+    x = LSTM(LSTM_UNITS[0], return_sequences=True)(x)
+    x = Dropout(DROPOUT_RATE)(x)
+    x = LSTM(LSTM_UNITS[1], return_sequences=False)(x)
+    x = Dropout(DROPOUT_RATE)(x)
+    encoder_out = x   # (batch, LSTM_UNITS[1]=64) — saved as attention Query source
+
+    # --- Decoder: produce structured output (48 hours x 12 steps) ---
+    # Encode context into dense vector, repeat for each output hour
+    x = Dense(DENSE_UNITS, activation='relu')(x)
+    x = Dropout(DROPOUT_RATE)(x)
+    x = RepeatVector(output_hours)(x)  # (batch, 48, 256)
+
+    # --- Week-level cross-attention over statistical profiles (Input 2) ---
+    #
+    # Instead of treating all 4 past same-weekday profiles equally, we let the
+    # encoder context decide which week is most relevant for the current forecast.
+    #
+    # Mechanism (scaled dot-product, Vaswani et al. 2017):
+    #   Query  : encoder LSTM output          (batch, LSTM_UNITS[1])
+    #   Keys   : one compact vector per week  (batch, n_weeks, ATTN_DIM)
+    #   Values : the raw per-step profiles    (batch, 576, n_weeks)
+    #   Output : weighted sum of profiles     (batch, 576, 1) → (batch, 48, 12)
+    #
+    n_weeks = stat_shape[1]
+
+    # Project each week's full 576-step profile to a compact key vector
+    stat_weeks = Permute((2, 1))(stat_input)                                         # (batch, n_weeks, 576)
+    week_keys  = Dense(ATTN_DIM, use_bias=False, name='attn_week_key')(stat_weeks)   # (batch, n_weeks, ATTN_DIM)
+
+    # Project encoder context to query space
+    query_proj = Dense(ATTN_DIM, use_bias=False, name='attn_query')(encoder_out)     # (batch, ATTN_DIM)
+    query_3d   = Reshape((1, ATTN_DIM))(query_proj)                                  # (batch, 1, ATTN_DIM)
+
+    # Scaled dot-product scores: query · keysᵀ / √d
+    scores  = Dot(axes=[2, 2], name='attn_scores')([query_3d, week_keys])            # (batch, 1, n_weeks)
+    scores  = Flatten()(scores)                                                       # (batch, n_weeks)
+    scores  = Lambda(lambda s: s / tf.math.sqrt(float(ATTN_DIM)),
+                     name='attn_scale')(scores)                                       # (batch, n_weeks)
+    attn_w  = Activation('softmax', name='week_attention')(scores)                   # (batch, n_weeks)
+
+    # Weighted sum of the n_weeks profiles → single attended profile
+    # stat_input (batch, 576, n_weeks) @ attn_w_col (batch, n_weeks, 1) → (batch, 576, 1)
+    attn_w_col  = Reshape((n_weeks, 1))(attn_w)                                      # (batch, n_weeks, 1)
+    attended    = Dot(axes=[2, 1], name='attn_weighted_sum')([stat_input, attn_w_col])# (batch, 576, 1)
+
+    # Reshape to hourly blocks then project to 32-dim — same output shape as before
+    stat = Reshape((output_hours, steps_per_hour), name='stat_reshape')(attended)    # (batch, 48, 12)
+    stat = TimeDistributed(Dense(32, activation='relu'), name='stat_proj')(stat)     # (batch, 48, 32)
+
+    # --- Process PV estimate (Input 3) ---
+    # Reshape (576, 1) → (48, 12) hourly blocks, then compress to 8-dim
+    pv = Reshape((output_hours, steps_per_hour))(pv_input)               # (batch, 48, 12)
+    pv = TimeDistributed(Dense(8, activation='relu'))(pv)                # (batch, 48, 8)
+
+    # --- Concatenate encoder context + statistical + PV conditioning ---
+    x = Concatenate()([x, stat, pv])  # (batch, 48, 256 + 32 + 8 = 296)
+
+    # LSTM decoder processes each hour with context, weekly pattern, and PV
+    x = LSTM(128, return_sequences=True)(x)  # (batch, 48, 128)
+    x = Dropout(DROPOUT_RATE)(x)
+
+    # TimeDistributed Dense: each hour -> 12 five-min steps
+    x = TimeDistributed(Dense(64, activation='relu'))(x)  # (batch, 48, 64)
+    x = TimeDistributed(Dense(steps_per_hour))(x)          # (batch, 48, 12)
+
+    # Flatten to (batch, 576)
+    outputs = Reshape((output_hours * steps_per_hour,))(x)
+
+    model = Model(inputs=[encoder_input, stat_input, pv_input], outputs=outputs)
+
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss=Huber(delta=1.0),  # Less sensitive to spikes than MSE
+        metrics=['mae']
+    )
+
+    return model
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+def compute_metrics(actual, predicted):
+    """Compute RMSE, MAE, MAPE between actual and predicted arrays."""
+    actual = actual.flatten()
+    predicted = predicted.flatten()
+
+    # Filter out invalid values
+    valid = np.isfinite(actual) & np.isfinite(predicted) & (actual > 0)
+    if valid.sum() == 0:
+        return {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+
+    a = actual[valid]
+    p = predicted[valid]
+
+    rmse = np.sqrt(mean_squared_error(a, p))
+    mae = mean_absolute_error(a, p)
+    mape = np.mean(np.abs((a - p) / a)) * 100
+
+    return {'rmse': rmse, 'mae': mae, 'mape': mape}
+
+
+# =============================================================================
+# STATISTICAL BASELINE
+# =============================================================================
+
+def compute_stat_baseline(df, forecast_timestamps,
+                           n_past_weeks=HYBRID_N_PAST_WEEKS,
+                           agg_method=HYBRID_AGG_METHOD):
+    """
+    Compute statistical same-day-of-week baseline for the forecast horizon.
+
+    For each 5-min slot in the forecast, find the same weekday+time slot
+    for the last n_past_weeks weeks and aggregate (mean or median).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full dataset with DateTime and Load_Is columns.
+    forecast_timestamps : list of pd.Timestamp
+        Timestamps for each forecast step.
+    n_past_weeks : int
+        Number of same-day-of-week weeks to look back.
+    agg_method : str
+        'mean' or 'median' for aggregating historical values.
+
+    Returns
+    -------
+    stat_values : np.ndarray
+        Statistical baseline prediction, shape (FORECAST_HORIZON,).
+    """
+    n_steps = len(forecast_timestamps)
+    stat_values = np.full(n_steps, np.nan)
+
+    # Build DatetimeIndex-based Series for fast nearest-neighbour lookup
+    df_load = df.set_index('DateTime')['Load_Is'].copy()
+    df_load = df_load[~df_load.index.duplicated(keep='first')].sort_index()
+
+    for i, ts in enumerate(forecast_timestamps):
+        ts = pd.Timestamp(ts)
+        historical_values = []
+
+        for w in range(1, n_past_weeks + 1):
+            hist_ts = ts - pd.Timedelta(weeks=w)
+            idx_arr = df_load.index.get_indexer([hist_ts], method='nearest',
+                                                 tolerance=pd.Timedelta(minutes=5))
+            if idx_arr[0] >= 0:
+                val = df_load.iloc[idx_arr[0]]
+                if np.isfinite(val) and val > 0:
+                    historical_values.append(val)
+
+        if len(historical_values) >= 1:
+            hist_arr = np.array(historical_values)
+            if agg_method == 'median':
+                stat_values[i] = np.median(hist_arr)
+            else:
+                stat_values[i] = np.mean(hist_arr)
+
+    return stat_values
+
+
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def plot_evaluation(y_test, y_pred, fc_test, ts_test, history):
+    """
+    Create evaluation plots comparing CNN-LSTM vs External Forecast.
+
+    Plots:
+      1. Forecast curves (Actual, CNN-LSTM, External) for the full horizon
+      2. KPI bar chart comparison (RMSE, MAE, MAPE)
+      3. Training history (loss curves)
+      4. Actual vs Predicted scatter plot
+      5. (96h only) Per-day KPI breakdown: Day+1, Day+2, Day+3, Day+4
+    """
+    # --- Compute KPIs across ALL test samples ---
+    cnn_metrics = compute_metrics(y_test, y_pred)
+
+    # External forecast: filter valid values (> 0)
+    fc_flat = fc_test.flatten()
+    y_flat = y_test.flatten()
+    fc_valid = np.isfinite(fc_flat) & (fc_flat > 0) & np.isfinite(y_flat) & (y_flat > 0)
+    if fc_valid.any():
+        ext_metrics = compute_metrics(y_flat[fc_valid], fc_flat[fc_valid])
+    else:
+        ext_metrics = {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+
+    # --- Print KPIs ---
+    print("\n" + "=" * 60)
+    print("MODEL COMPARISON (across all test samples)")
+    print("=" * 60)
+    print(f"{'Metric':<10} {'CNN-LSTM':>12} {'External':>12}")
+    print("-" * 36)
+    print(f"{'RMSE':<10} {cnn_metrics['rmse']:>12.2f} {ext_metrics['rmse']:>12.2f}")
+    print(f"{'MAE':<10} {cnn_metrics['mae']:>12.2f} {ext_metrics['mae']:>12.2f}")
+    print(f"{'MAPE':<10} {cnn_metrics['mape']:>11.2f}% {ext_metrics['mape']:>11.2f}%")
+    print("=" * 60)
+
+    # --- Create figure ---
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+
+    # PLOT 1: Representative 48h forecast (3 curves)
+    ax1 = axes[0, 0]
+    sample_idx = len(y_test) // 2
+    actual = y_test[sample_idx]
+    predicted = y_pred[sample_idx]
+    external = fc_test[sample_idx]
+    x = np.arange(FORECAST_HORIZON)
+
+    ax1.plot(x, actual, 'b-', label='Actual (Load_Is)', linewidth=1.2)
+    ax1.plot(x, predicted, 'r--', label='CNN-LSTM Prediction', linewidth=1.2)
+    ext_plot_valid = np.isfinite(external) & (external > 0)
+    if ext_plot_valid.any():
+        ax1.plot(x[ext_plot_valid], external[ext_plot_valid], 'g-.',
+                 label='External Forecast', linewidth=1.2)
+    ax1.set_title(f'{OUTPUT_HOURS}h Forecast from {pd.Timestamp(ts_test[sample_idx]).strftime("%Y-%m-%d %H:%M")}',
+                  fontsize=13, fontweight='bold')
+    ax1.set_xlabel('Time step (5-min intervals)')
+    ax1.set_ylabel('Load (kW)')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    # Add hour ticks
+    tick_pos = np.arange(0, FORECAST_HORIZON, 72)  # every 6 hours
+    tick_labels = [f'+{int(p * 5 / 60)}h' for p in tick_pos]
+    ax1.set_xticks(tick_pos)
+    ax1.set_xticklabels(tick_labels)
+
+    # PLOT 2: KPI bar chart comparison
+    ax2 = axes[0, 1]
+    metric_names = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+    cnn_vals = [cnn_metrics['rmse'], cnn_metrics['mae'], cnn_metrics['mape']]
+    ext_vals = [ext_metrics['rmse'], ext_metrics['mae'], ext_metrics['mape']]
+    x_pos = np.arange(len(metric_names))
+    width = 0.35
+
+    bars_cnn = ax2.bar(x_pos - width / 2, cnn_vals, width,
+                       label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+    bars_ext = ax2.bar(x_pos + width / 2, ext_vals, width,
+                       label='External Forecast', color='coral', edgecolor='black', alpha=0.8)
+
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(metric_names, fontsize=11)
+    ax2.set_title('Model Comparison: KPIs', fontsize=13, fontweight='bold')
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    # Add value labels on bars
+    for bar_group in [bars_cnn, bars_ext]:
+        for bar in bar_group:
+            h = bar.get_height()
+            if np.isfinite(h):
+                ax2.text(bar.get_x() + bar.get_width() / 2, h,
+                         f'{h:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    # PLOT 3: Training history
+    ax3 = axes[1, 0]
+    ax3.plot(history.history['loss'], label='Training Loss', linewidth=2)
+    ax3.plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+    ax3.set_title('Training History', fontsize=13, fontweight='bold')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Loss (MSE)')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
+
+    # PLOT 4: Actual vs Predicted scatter
+    ax4 = axes[1, 1]
+    ax4.scatter(y_test.flatten(), y_pred.flatten(), alpha=0.2, s=3, c='steelblue')
+    min_val = min(y_test.min(), y_pred.min())
+    max_val = max(y_test.max(), y_pred.max())
+    ax4.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2,
+             label='Perfect Prediction')
+    ax4.set_title('Actual vs Predicted', fontsize=13, fontweight='bold')
+    ax4.set_xlabel('Actual Load (kW)')
+    ax4.set_ylabel('Predicted Load (kW)')
+    ax4.legend(fontsize=10)
+    ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(RESULTS_DIR, 'CNN_LSTM_Results.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"\nResults plot saved to: {save_path}")
+
+    # --- Extra per-day KPI breakdown (only for horizons longer than 48h) ---
+    if OUTPUT_HOURS > 48:
+        n_days = OUTPUT_HOURS // 24
+        steps_per_day = 24 * STEPS_PER_HOUR
+        day_labels = [f'Day +{d+1}' for d in range(n_days)]
+
+        rmse_cnn, mae_cnn, mape_cnn = [], [], []
+        rmse_ext, mae_ext, mape_ext = [], [], []
+
+        for d in range(n_days):
+            s = d * steps_per_day
+            e = s + steps_per_day
+            yt_d = y_test[:, s:e].flatten()
+            yp_d = y_pred[:, s:e].flatten()
+            m_cnn = compute_metrics(yt_d, yp_d)
+            rmse_cnn.append(m_cnn['rmse'])
+            mae_cnn.append(m_cnn['mae'])
+            mape_cnn.append(m_cnn['mape'])
+
+            fc_d = fc_test[:, s:e].flatten()
+            valid = np.isfinite(fc_d) & (fc_d > 0) & np.isfinite(yt_d) & (yt_d > 0)
+            if valid.any():
+                m_ext = compute_metrics(yt_d[valid], fc_d[valid])
+            else:
+                m_ext = {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+            rmse_ext.append(m_ext['rmse'])
+            mae_ext.append(m_ext['mae'])
+            mape_ext.append(m_ext['mape'])
+
+        fig2, axes2 = plt.subplots(1, 3, figsize=(16, 5))
+        x_pos = np.arange(n_days)
+        width = 0.35
+        titles = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+        cnn_series = [rmse_cnn, mae_cnn, mape_cnn]
+        ext_series = [rmse_ext, mae_ext, mape_ext]
+
+        for ax, title, cnn_vals, ext_vals in zip(axes2, titles, cnn_series, ext_series):
+            bars_c = ax.bar(x_pos - width / 2, cnn_vals, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+            bars_e = ax.bar(x_pos + width / 2, ext_vals, width,
+                            label='External', color='coral', edgecolor='black', alpha=0.8)
+            for bars in [bars_c, bars_e]:
+                for bar in bars:
+                    h = bar.get_height()
+                    if np.isfinite(h):
+                        ax.text(bar.get_x() + bar.get_width() / 2, h,
+                                f'{h:.1f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(day_labels, fontsize=11)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+
+        fig2.suptitle(f'{OUTPUT_HOURS}h Forecast — KPI per Day', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        save_path2 = os.path.join(RESULTS_DIR, f'CNN_LSTM_Results_{OUTPUT_HOURS}h_PerDay.png')
+        plt.savefig(save_path2, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Per-day KPI plot saved to: {save_path2}")
+
+
+# =============================================================================
+# SAVE / LOAD CONFIG
+# =============================================================================
+
+def save_config(scaler_X, scaler_y, scaler_stat, scaler_pv):
+    """Save scalers and model configuration for later prediction."""
+    np.savez(CONFIG_PATH,
+             lookback_steps=LOOKBACK_STEPS,
+             forecast_horizon=FORECAST_HORIZON,
+             stat_n_weeks=STAT_N_WEEKS,
+             feature_columns=np.array(INPUT_FEATURES),
+             scaler_X_min_=scaler_X.min_,
+             scaler_X_scale_=scaler_X.scale_,
+             scaler_X_data_min_=scaler_X.data_min_,
+             scaler_X_data_max_=scaler_X.data_max_,
+             scaler_X_data_range_=scaler_X.data_range_,
+             scaler_y_min_=scaler_y.min_,
+             scaler_y_scale_=scaler_y.scale_,
+             scaler_y_data_min_=scaler_y.data_min_,
+             scaler_y_data_max_=scaler_y.data_max_,
+             scaler_y_data_range_=scaler_y.data_range_,
+             scaler_stat_min_=scaler_stat.min_,
+             scaler_stat_scale_=scaler_stat.scale_,
+             scaler_stat_data_min_=scaler_stat.data_min_,
+             scaler_stat_data_max_=scaler_stat.data_max_,
+             scaler_stat_data_range_=scaler_stat.data_range_,
+             scaler_pv_min_=scaler_pv.min_,
+             scaler_pv_scale_=scaler_pv.scale_,
+             scaler_pv_data_min_=scaler_pv.data_min_,
+             scaler_pv_data_max_=scaler_pv.data_max_,
+             scaler_pv_data_range_=scaler_pv.data_range_)
+    print(f"Config saved to: {CONFIG_PATH}")
+
+
+def load_config():
+    """Load scalers and model configuration."""
+    config = np.load(CONFIG_PATH, allow_pickle=True)
+
+    scaler_X = MinMaxScaler()
+    scaler_X.min_ = config['scaler_X_min_']
+    scaler_X.scale_ = config['scaler_X_scale_']
+    scaler_X.data_min_ = config['scaler_X_data_min_']
+    scaler_X.data_max_ = config['scaler_X_data_max_']
+    scaler_X.data_range_ = config['scaler_X_data_range_']
+    scaler_X.n_features_in_ = len(config['scaler_X_min_'])
+
+    scaler_y = MinMaxScaler()
+    scaler_y.min_ = config['scaler_y_min_']
+    scaler_y.scale_ = config['scaler_y_scale_']
+    scaler_y.data_min_ = config['scaler_y_data_min_']
+    scaler_y.data_max_ = config['scaler_y_data_max_']
+    scaler_y.data_range_ = config['scaler_y_data_range_']
+    scaler_y.n_features_in_ = len(config['scaler_y_min_'])
+
+    scaler_stat = MinMaxScaler()
+    scaler_stat.min_ = config['scaler_stat_min_']
+    scaler_stat.scale_ = config['scaler_stat_scale_']
+    scaler_stat.data_min_ = config['scaler_stat_data_min_']
+    scaler_stat.data_max_ = config['scaler_stat_data_max_']
+    scaler_stat.data_range_ = config['scaler_stat_data_range_']
+    scaler_stat.n_features_in_ = len(config['scaler_stat_min_'])
+
+    scaler_pv = MinMaxScaler()
+    scaler_pv.min_ = config['scaler_pv_min_']
+    scaler_pv.scale_ = config['scaler_pv_scale_']
+    scaler_pv.data_min_ = config['scaler_pv_data_min_']
+    scaler_pv.data_max_ = config['scaler_pv_data_max_']
+    scaler_pv.data_range_ = config['scaler_pv_data_range_']
+    scaler_pv.n_features_in_ = len(config['scaler_pv_min_'])
+
+    return scaler_X, scaler_y, scaler_stat, scaler_pv
+
+
+# =============================================================================
+# TRAIN MODE
+# =============================================================================
+
+def run_train():
+    """Train the CNN-LSTM model, evaluate on held-out test set, save model."""
+    # Fix random seed for reproducible training (avoids local-minimum lottery)
+    SEED = 42
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
+
+    print("=" * 70)
+    print("CNN-LSTM 48h LOAD PREDICTION - TRAINING")
+    print("=" * 70)
+
+    # 1. Load PV correction table + data
+    print("\n--- Step 1: Loading Data ---")
+    ratio_table = load_pv_correction_table()
+    df = load_data(ratio_table=ratio_table)
+
+    # 2. Create sequences (only from rows with valid Load_Is)
+    print("\n--- Step 2: Creating Sequences ---")
+    print(f"  Lookback: {LOOKBACK_STEPS} steps ({LOOKBACK_STEPS * 5 / 60:.0f}h)")
+    print(f"  Forecast: {FORECAST_HORIZON} steps ({FORECAST_HORIZON * 5 / 60:.0f}h)")
+    print(f"  Step size: {STEP_SIZE} ({STEP_SIZE * 5}min)")
+
+    X, y, timestamps, forecast_loads, start_indices, pv_horizons = create_sequences(
+        df, step=STEP_SIZE)
+
+    if len(X) == 0:
+        print("ERROR: No valid sequences could be created. Check data.")
+        return
+
+    # 2b. Build statistical profiles for decoder conditioning (Input 2)
+    print("\n--- Step 2b: Building Statistical Profiles ---")
+    load_values = df['Load_Is'].values.astype(np.float32)
+    stat_profiles = build_stat_profiles(load_values, start_indices,
+                                        horizon=FORECAST_HORIZON,
+                                        n_weeks=STAT_N_WEEKS)
+    print(f"  Stat profiles shape: {stat_profiles.shape}  "
+          f"(samples, horizon, {STAT_N_WEEKS} weeks)")
+
+    # 3. Train/test split by time
+    print("\n--- Step 3: Train/Test Split ---")
+    last_date = pd.Timestamp(timestamps[-1])
+    test_cutoff = last_date - pd.Timedelta(days=TEST_DAYS)
+
+    mask_train = timestamps < np.datetime64(test_cutoff)
+    mask_test = timestamps >= np.datetime64(test_cutoff)
+
+    X_train, y_train = X[mask_train], y[mask_train]
+    X_test, y_test = X[mask_test], y[mask_test]
+    stat_train = stat_profiles[mask_train]
+    stat_test = stat_profiles[mask_test]
+    pv_train = pv_horizons[mask_train]
+    pv_test  = pv_horizons[mask_test]
+    ts_test = timestamps[mask_test]
+    fc_test = forecast_loads[mask_test]
+
+    print(f"  Test cutoff: {test_cutoff.strftime('%Y-%m-%d')}")
+    print(f"  Training samples: {len(X_train)}")
+    print(f"  Test samples: {len(X_test)}")
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        print("ERROR: Not enough data for train/test split.")
+        return
+
+    # 4. Scale features, targets, stat profiles, and PV horizons
+    print("\n--- Step 4: Scaling ---")
+    n_train, n_steps, n_feat = X_train.shape
+    n_test = X_test.shape[0]
+
+    # Fit scaler on raw feature columns, then apply via broadcasting.
+    # Using reshape(-1, n_feat) on the windowed array would allocate ~10 GB for
+    # long datasets (n_train * n_steps rows); broadcasting over the 3-D array
+    # is mathematically identical and uses only the working array memory.
+    scaler_X = MinMaxScaler()
+    scaler_X.fit(df[INPUT_FEATURES].dropna().values.astype(np.float32))
+    # MinMaxScaler formula: X_scaled = X * scale_ + min_  (both shape (n_feat,))
+    # Scale in-place to avoid creating a second large copy of the array.
+    X_train *= scaler_X.scale_
+    X_train += scaler_X.min_
+    X_train_s = X_train          # already scaled, same array
+    X_test *= scaler_X.scale_
+    X_test += scaler_X.min_
+    X_test_s = X_test            # already scaled, same array
+
+    scaler_y = MinMaxScaler()
+    y_train_s = scaler_y.fit_transform(y_train)
+
+    # Scale stat profiles: reshape (N, 576, 4) → (N*576, 4), scale, reshape back
+    scaler_stat = MinMaxScaler()
+    stat_train_s = scaler_stat.fit_transform(
+        stat_train.reshape(-1, STAT_N_WEEKS)).reshape(n_train, FORECAST_HORIZON, STAT_N_WEEKS)
+    stat_test_s = scaler_stat.transform(
+        stat_test.reshape(-1, STAT_N_WEEKS)).reshape(n_test, FORECAST_HORIZON, STAT_N_WEEKS)
+
+    # Scale PV horizons: reshape (N, 576) → (N*576, 1), scale, reshape to (N, 576, 1)
+    scaler_pv = MinMaxScaler()
+    pv_train_s = scaler_pv.fit_transform(
+        pv_train.reshape(-1, 1)).reshape(n_train, FORECAST_HORIZON, 1)
+    pv_test_s = scaler_pv.transform(
+        pv_test.reshape(-1, 1)).reshape(n_test, FORECAST_HORIZON, 1)
+
+    print(f"  Feature range: [{scaler_X.data_min_.min():.1f}, {scaler_X.data_max_.max():.1f}]")
+    print(f"  Target range:  [{scaler_y.data_min_.min():.1f}, {scaler_y.data_max_.max():.1f}]")
+    print(f"  Stat range:    [{scaler_stat.data_min_.min():.1f}, {scaler_stat.data_max_.max():.1f}]")
+    print(f"  PV range:      [{scaler_pv.data_min_.min():.1f}, {scaler_pv.data_max_.max():.1f}] kW")
+
+    # 5. Build model (triple input: encoder + stat + PV conditioning)
+    print("\n--- Step 5: Building Model ---")
+    model = build_model(
+        input_shape=(n_steps, n_feat),
+        stat_shape=(FORECAST_HORIZON, STAT_N_WEEKS),
+        pv_shape=(FORECAST_HORIZON, 1))
+    model.summary()
+
+    # 6. Train with triple inputs
+    print("\n--- Step 6: Training ---")
+
+    # Random validation split — drawn uniformly across all seasons so the
+    # validation set is not biased toward the most recent months.
+    val_size  = max(1, int(n_train * VAL_RATIO))
+    val_idx   = np.random.choice(n_train, size=val_size, replace=False)
+    train_idx = np.setdiff1d(np.arange(n_train), val_idx)
+
+    def _split(arr):
+        return arr[train_idx], arr[val_idx]
+
+    Xt, Xv         = _split(X_train_s)
+    St, Sv         = _split(stat_train_s)
+    Pt, Pv         = _split(pv_train_s)
+    yt, yv         = _split(y_train_s)
+    print(f"  Train samples: {len(train_idx)}  |  Val samples: {len(val_idx)}  "
+          f"(random {VAL_RATIO*100:.0f}% across all seasons)")
+
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6),
+        ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True),
+    ]
+
+    start_time = time.time()
+    history = model.fit(
+        [Xt, St, Pt], yt,
+        validation_data=([Xv, Sv, Pv], yv),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        callbacks=callbacks,
+        verbose=1
+    )
+    train_time = time.time() - start_time
+    print(f"\n  Training completed in {train_time:.0f}s ({len(history.history['loss'])} epochs)")
+
+    # 7. Predict on test set
+    print("\n--- Step 7: Evaluating on Test Set ---")
+    y_pred_s = model.predict([X_test_s, stat_test_s, pv_test_s], verbose=0)
+    y_pred = scaler_y.inverse_transform(y_pred_s)
+
+    # 8. Visualize and compare
+    plot_evaluation(y_test, y_pred, fc_test, ts_test, history)
+
+    # 9. Save config (including all scalers)
+    print("\n--- Step 8: Saving Model & Config ---")
+    save_config(scaler_X, scaler_y, scaler_stat, scaler_pv)
+    print(f"  Model saved to: {MODEL_PATH}")
+
+    print("\n" + "=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+
+
+# =============================================================================
+# PREDICT MODE
+# =============================================================================
+
+def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_METHOD):
+    """
+    Load saved model and predict 48h from a given date.
+
+    Produces three forecasts:
+      1. CNN-LSTM (AI model)
+      2. Statistical baseline (mean of last N same-weekday values)
+      3. External forecast (from data file)
+
+    Parameters
+    ----------
+    date_str : str
+        Prediction start date in format YYYY-MM-DD or YYYY-MM-DD HH:MM
+    n_weeks : int
+        Number of same-day-of-week weeks to look back for statistical baseline.
+    agg_method : str
+        'mean' or 'median' for aggregating historical same-weekday values.
+    """
+    print("=" * 70)
+    print(f"CNN-LSTM 48h LOAD PREDICTION - PREDICT FROM {date_str}")
+    print("=" * 70)
+
+    # 1. Check model exists
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(CONFIG_PATH):
+        print("ERROR: Model not found. Run --train first.")
+        print(f"  Expected: {MODEL_PATH}")
+        print(f"  Expected: {CONFIG_PATH}")
+        return
+
+    # 2. Load model and config
+    print("\n--- Loading model ---")
+    model = load_model(MODEL_PATH)
+    scaler_X, scaler_y, scaler_stat, scaler_pv = load_config()
+    n_feat = len(INPUT_FEATURES)
+
+    # 3. Load PV correction table + data
+    print("\n--- Loading data ---")
+    ratio_table = load_pv_correction_table()
+    df = load_data(ratio_table=ratio_table)
+
+    # 4. Find prediction start point
+    pred_date = pd.to_datetime(date_str)
+    idx = (df['DateTime'] - pred_date).abs().idxmin()
+    actual_start = df['DateTime'].iloc[idx]
+    print(f"  Prediction starts at: {actual_start}")
+
+    if idx < LOOKBACK_STEPS:
+        print(f"ERROR: Not enough history. Need {LOOKBACK_STEPS} steps before {date_str}.")
+        print(f"  Available: {idx} steps. Earliest possible date: "
+              f"{df['DateTime'].iloc[LOOKBACK_STEPS]}")
+        return
+
+    # 5. Extract encoder input (7 days before prediction point)
+    input_df = df.iloc[idx - LOOKBACK_STEPS:idx]
+    X = input_df[INPUT_FEATURES].values.astype(np.float32)
+
+    if np.isnan(X).any():
+        nan_cols = [INPUT_FEATURES[c] for c in range(X.shape[1]) if np.isnan(X[:, c]).any()]
+        print(f"WARNING: NaN in input features: {nan_cols}. Filling with interpolation.")
+        X = pd.DataFrame(X, columns=INPUT_FEATURES).interpolate().bfill().ffill().values
+
+    # 5b. Build statistical profile for decoder conditioning (Input 2)
+    load_values = df['Load_Is'].values.astype(np.float32)
+    stat_profile = build_stat_profiles(load_values, np.array([idx]),
+                                        horizon=FORECAST_HORIZON,
+                                        n_weeks=STAT_N_WEEKS)  # (1, 576, 4)
+    print(f"  Stat profile built: {stat_profile.shape}")
+
+    # 5c. Extract PV estimate for forecast horizon (Input 3)
+    # PV_Est was already computed in load_data() via the correction table
+    end_pv = min(idx + FORECAST_HORIZON, len(df))
+    pv_slice = df['PV_Est'].values[idx:end_pv].astype(np.float32)
+    # Pad with zeros if forecast period extends beyond data
+    if len(pv_slice) < FORECAST_HORIZON:
+        pv_slice = np.pad(pv_slice, (0, FORECAST_HORIZON - len(pv_slice)))
+    pv_profile = pv_slice.reshape(1, FORECAST_HORIZON)   # (1, 576)
+    print(f"  PV estimate built: max={pv_slice.max():.1f} kW, "
+          f"mean_daytime={pv_slice[pv_slice > 0].mean():.1f} kW"
+          if pv_slice.max() > 0 else "  PV estimate: 0 kW (nighttime / no irradiance data)")
+
+    # 6. Scale and predict (triple inputs)
+    X_scaled = scaler_X.transform(X.reshape(-1, n_feat)).reshape(1, LOOKBACK_STEPS, n_feat)
+    stat_scaled = scaler_stat.transform(
+        stat_profile.reshape(-1, STAT_N_WEEKS)).reshape(1, FORECAST_HORIZON, STAT_N_WEEKS)
+    pv_scaled = scaler_pv.transform(
+        pv_profile.reshape(-1, 1)).reshape(1, FORECAST_HORIZON, 1)
+    y_pred_s = model.predict([X_scaled, stat_scaled, pv_scaled], verbose=0)
+    y_pred = scaler_y.inverse_transform(y_pred_s).flatten()
+
+    # 7. Generate timestamps
+    start_time = df['DateTime'].iloc[idx]
+    future_ts = [start_time + pd.Timedelta(minutes=5 * i)
+                 for i in range(FORECAST_HORIZON)]
+
+    # 7b. Compute statistical baseline (4-week same-weekday mean)
+    print(f"\n--- Computing Statistical Baseline ---")
+    print(f"  Aggregation: {agg_method} | Past weeks: {n_weeks}")
+    stat_values = compute_stat_baseline(
+        df, future_ts, n_past_weeks=n_weeks, agg_method=agg_method)
+
+    # 8. Get actual and external forecast if available in the dataset
+    end_idx = min(idx + FORECAST_HORIZON, len(df))
+    future_df = df.iloc[idx:end_idx]
+    actual_load = pd.to_numeric(future_df['Load_Is'], errors='coerce').values
+    external_load = pd.to_numeric(future_df['Forecast_Load'], errors='coerce').values
+
+    # 9. Compute KPIs and Plot
+    has_actual = len(actual_load) > 0 and np.isfinite(actual_load).any()
+    ext_valid = np.isfinite(external_load) & (external_load > 0)
+
+    # Compute metrics on LAST 24h only (fair comparison: external forecasts 1 day ahead)
+    KPI_START = 24 * STEPS_PER_HOUR  # step = +24h mark
+    cnn_m = None
+    stat_m = None
+    ext_m = None
+    if has_actual and len(actual_load) > KPI_START:
+        kpi_actual = actual_load[KPI_START:]
+        kpi_len = len(kpi_actual)
+        cnn_m = compute_metrics(kpi_actual, y_pred[KPI_START:KPI_START + kpi_len])
+        stat_m = compute_metrics(kpi_actual, stat_values[KPI_START:KPI_START + kpi_len])
+        kpi_ext = external_load[KPI_START:] if len(external_load) > KPI_START else np.array([])
+        kpi_ext_valid = np.isfinite(kpi_ext) & (kpi_ext > 0)
+        if kpi_ext_valid.any():
+            ext_m = compute_metrics(kpi_actual[kpi_ext_valid[:kpi_len]],
+                                     kpi_ext[kpi_ext_valid[:len(kpi_ext)]])
+
+    # --- PLOT: Forecast + KPIs + Weight Profile ---
+    tick_pos = np.arange(0, FORECAST_HORIZON, 72)  # every 6 hours
+    tick_labels = [(start_time + pd.Timedelta(minutes=5 * p)).strftime('%m-%d %H:%M')
+                   for p in tick_pos]
+
+    if has_actual and cnn_m is not None:
+        fig = plt.figure(figsize=(20, 8))
+        gs = fig.add_gridspec(1, 2, width_ratios=[2, 1], wspace=0.3)
+        ax1 = fig.add_subplot(gs[0, 0])   # Forecast curves
+        ax2 = fig.add_subplot(gs[0, 1])   # KPI bars
+    else:
+        fig = plt.figure(figsize=(16, 6))
+        ax1 = fig.add_subplot(1, 1, 1)
+        ax2 = None
+
+    # --- Left: Forecast curves ---
+    x = np.arange(FORECAST_HORIZON)
+
+    if has_actual:
+        ax1.plot(x[:len(actual_load)], actual_load, 'b-',
+                 label='Actual (Load_Is)', linewidth=1.5)
+
+    ax1.plot(x, y_pred, 'r-', label='CNN-LSTM (AI)', linewidth=1.5, alpha=0.7)
+    ax1.plot(x, stat_values, 'c--',
+             label=f'Statistical ({agg_method}, {n_weeks}w)',
+             linewidth=1.0, alpha=0.5)
+
+    # Overlay PV estimate (on secondary y-axis to avoid scale clash)
+    if pv_slice.max() > 0:
+        ax1_twin = ax1.twinx()
+        ax1_twin.fill_between(x, 0, pv_slice, alpha=0.15, color='gold')
+        ax1_twin.plot(x, pv_slice, color='gold', linewidth=0.8, alpha=0.6,
+                      label='PV Est (kW)')
+        ax1_twin.set_ylabel('PV Est (kW)', fontsize=9, color='goldenrod')
+        ax1_twin.tick_params(axis='y', labelcolor='goldenrod', labelsize=8)
+        ax1_twin.legend(fontsize=8, loc='upper left')
+
+    if ext_valid.any():
+        ax1.plot(x[:len(external_load)][ext_valid[:len(external_load)]],
+                 external_load[ext_valid[:len(external_load)]],
+                 'g-.', label='External Forecast', linewidth=1.5)
+
+    ax1.set_title(f'{OUTPUT_HOURS}h Load Prediction from {date_str}', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Load (kW)', fontsize=12)
+    ax1.legend(fontsize=9, loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(tick_pos)
+    ax1.set_xticklabels(tick_labels, rotation=45, ha='right')
+
+    # --- Right: KPI bar chart (CNN-LSTM vs Statistical vs External) ---
+    if ax2 is not None and cnn_m is not None:
+        metric_names = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+        cnn_vals = [cnn_m['rmse'], cnn_m['mae'], cnn_m['mape']]
+        stat_vals = [stat_m['rmse'], stat_m['mae'], stat_m['mape']]
+        x_pos = np.arange(len(metric_names))
+
+        if ext_m is not None:
+            ext_vals = [ext_m['rmse'], ext_m['mae'], ext_m['mape']]
+            width = 0.25
+            bars_cnn = ax2.bar(x_pos - width, cnn_vals, width,
+                               label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+            bars_stat = ax2.bar(x_pos, stat_vals, width,
+                                label=f'Stats ({agg_method})', color='cyan', edgecolor='black', alpha=0.8)
+            bars_ext = ax2.bar(x_pos + width, ext_vals, width,
+                               label='External', color='coral', edgecolor='black', alpha=0.8)
+            all_bars = [bars_cnn, bars_stat, bars_ext]
+        else:
+            width = 0.3
+            bars_cnn = ax2.bar(x_pos - width / 2, cnn_vals, width,
+                               label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+            bars_stat = ax2.bar(x_pos + width / 2, stat_vals, width,
+                                label=f'Stats ({agg_method})', color='cyan', edgecolor='black', alpha=0.8)
+            all_bars = [bars_cnn, bars_stat]
+
+        for bar_group in all_bars:
+            for bar in bar_group:
+                h = bar.get_height()
+                if np.isfinite(h):
+                    ax2.text(bar.get_x() + bar.get_width() / 2, h,
+                             f'{h:.1f}', ha='center', va='bottom', fontsize=7, fontweight='bold')
+
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(metric_names, fontsize=11)
+        ax2.set_title('Prediction KPIs (last 24h)', fontsize=14, fontweight='bold')
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plot_path = os.path.join(RESULTS_DIR, f'Prediction_{date_str.replace(":", "-")}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"\nPlot saved to: {plot_path}")
+
+    # 10. Print KPIs to console as well
+    if has_actual and cnn_m is not None:
+        print(f"\nCNN-LSTM  | RMSE: {cnn_m['rmse']:.2f} kW, "
+              f"MAE: {cnn_m['mae']:.2f} kW, MAPE: {cnn_m['mape']:.2f}%")
+        if stat_m is not None:
+            print(f"Stats     | RMSE: {stat_m['rmse']:.2f} kW, "
+                  f"MAE: {stat_m['mae']:.2f} kW, MAPE: {stat_m['mape']:.2f}%")
+        if ext_m is not None:
+            print(f"External  | RMSE: {ext_m['rmse']:.2f} kW, "
+                  f"MAE: {ext_m['mae']:.2f} kW, MAPE: {ext_m['mape']:.2f}%")
+    else:
+        print("\nNo actual load data available for this period (future prediction).")
+
+    # 10b. Per-day KPI breakdown (only when horizon > 48h and actual data is present)
+    if OUTPUT_HOURS > 48 and has_actual:
+        steps_per_day = 24 * STEPS_PER_HOUR
+        n_days = OUTPUT_HOURS // 24
+        print(f"\n--- Per-Day KPI Breakdown ({OUTPUT_HOURS}h forecast) ---")
+        print(f"{'Day':<10} {'CNN RMSE':>10} {'CNN MAE':>10} {'CNN MAPE':>10} "
+              f"{'Stat RMSE':>10} {'Stat MAE':>10} {'Stat MAPE':>10}")
+        print("-" * 72)
+
+        day_labels, day_cnn, day_stat, day_ext = [], [], [], []
+        for d in range(n_days):
+            s = d * steps_per_day
+            e = s + steps_per_day
+            label = (start_time + pd.Timedelta(hours=24 * d)).strftime('%a %d.%m')
+            day_labels.append(f'Day+{d+1}\n{label}')
+
+            act_d = actual_load[s:e] if len(actual_load) >= e else actual_load[s:]
+            if len(act_d) == 0 or not np.isfinite(act_d).any():
+                print(f"  Day+{d+1} ({label}): no actual data")
+                day_cnn.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                day_stat.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                day_ext.append({'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
+                continue
+
+            pred_d = y_pred[s:s + len(act_d)]
+            stat_d = stat_values[s:s + len(act_d)]
+            m_cnn  = compute_metrics(act_d, pred_d)
+            m_stat = compute_metrics(act_d, stat_d)
+            day_cnn.append(m_cnn)
+            day_stat.append(m_stat)
+
+            ext_d = external_load[s:e] if len(external_load) >= e else external_load[s:]
+            ext_d = ext_d[:len(act_d)]
+            ext_valid_d = np.isfinite(ext_d) & (ext_d > 0)
+            if ext_valid_d.any():
+                m_ext = compute_metrics(act_d[ext_valid_d], ext_d[ext_valid_d])
+            else:
+                m_ext = {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan}
+            day_ext.append(m_ext)
+
+            print(f"  Day+{d+1} ({label}) | "
+                  f"CNN: {m_cnn['rmse']:6.1f} kW / {m_cnn['mae']:6.1f} kW / {m_cnn['mape']:5.1f}%  |  "
+                  f"Stat: {m_stat['rmse']:6.1f} kW / {m_stat['mae']:6.1f} kW / {m_stat['mape']:5.1f}%")
+
+        # Per-day KPI bar chart
+        fig_d, axes_d = plt.subplots(1, 3, figsize=(16, 5))
+        x_pos = np.arange(n_days)
+        width = 0.25
+        titles = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
+        keys   = ['rmse', 'mae', 'mape']
+
+        for ax, title, key in zip(axes_d, titles, keys):
+            cnn_v  = [d[key] for d in day_cnn]
+            stat_v = [d[key] for d in day_stat]
+            ext_v  = [d[key] for d in day_ext]
+            has_ext = any(np.isfinite(v) for v in ext_v)
+
+            if has_ext:
+                bc = ax.bar(x_pos - width, cnn_v, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+                bs = ax.bar(x_pos,          stat_v, width,
+                            label='Statistical', color='cyan', edgecolor='black', alpha=0.8)
+                be = ax.bar(x_pos + width,  ext_v, width,
+                            label='External', color='coral', edgecolor='black', alpha=0.8)
+                all_b = [bc, bs, be]
+            else:
+                bc = ax.bar(x_pos - width / 2, cnn_v, width,
+                            label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
+                bs = ax.bar(x_pos + width / 2, stat_v, width,
+                            label='Statistical', color='cyan', edgecolor='black', alpha=0.8)
+                all_b = [bc, bs]
+
+            for bars in all_b:
+                for bar in bars:
+                    h = bar.get_height()
+                    if np.isfinite(h):
+                        ax.text(bar.get_x() + bar.get_width() / 2, h,
+                                f'{h:.1f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(day_labels, fontsize=9)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+
+        fig_d.suptitle(f'{OUTPUT_HOURS}h Prediction — KPI per Day  |  from {date_str}',
+                       fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        plot_day_path = os.path.join(RESULTS_DIR,
+                                     f'Prediction_{date_str.replace(":", "-")}_PerDay.png')
+        plt.savefig(plot_day_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Per-day KPI plot saved to: {plot_day_path}")
+
+    # 11. Save predictions to CSV
+    # Build full 5-min DataFrame, then trim first 24h, then resample to 15-min (mean)
+    EXPORT_SKIP = 24 * STEPS_PER_HOUR   # drop first 24h (288 steps)
+    pred_df = pd.DataFrame({
+        'DateTime':        future_ts,
+        'CNN_LSTM_Load_kW': y_pred,
+        'PV_Est_kW':        pv_slice,
+    })
+    # Drop first 24h
+    pred_df = pred_df.iloc[EXPORT_SKIP:].reset_index(drop=True)
+    # Resample to 15-min mean (3 consecutive 5-min steps → 1 value)
+    pred_df = (
+        pred_df.set_index('DateTime')
+               .resample('15min')
+               .mean()
+               .reset_index()
+    )
+    pred_df['CNN_LSTM_Load_kW'] = pred_df['CNN_LSTM_Load_kW'].round(1)
+    pred_df['PV_Est_kW']        = pred_df['PV_Est_kW'].round(1)
+
+    export_date_str = (pd.to_datetime(date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    csv_path = os.path.join(RESULTS_DIR, f'Prediction_{export_date_str}.csv')
+    pred_df.to_csv(csv_path, index=False)
+    print(f"Predictions saved to: {csv_path}  "
+          f"({len(pred_df)} rows @ 15-min, starting +24h from {date_str})")
+
+    # Summary
+    export_start = pred_df['DateTime'].iloc[0]
+    export_end   = pred_df['DateTime'].iloc[-1]
+    print(f"\n--- Prediction Summary ---")
+    print(f"  Full horizon : {future_ts[0]} to {future_ts[-1]}")
+    print(f"  Exported     : {export_start} to {export_end}  ({len(pred_df)} rows @ 15-min)")
+    print(f"  CNN-LSTM  -> Mean: {pred_df['CNN_LSTM_Load_kW'].mean():.1f} kW, "
+          f"Min: {pred_df['CNN_LSTM_Load_kW'].min():.1f}, "
+          f"Max: {pred_df['CNN_LSTM_Load_kW'].max():.1f}")
+
+
+# =============================================================================
+# PUBLIC API — call this from main.py or any other script
+# =============================================================================
+
+def run_forecast(predict_date: str, hours: int = OUTPUT_HOURS,
+                 n_weeks: int = HYBRID_N_PAST_WEEKS,
+                 agg_method: str = HYBRID_AGG_METHOD):
+    """
+    Run a forecast programmatically without argparse.
+    predict_date : 'YYYY-MM-DD'
+    hours        : 48 or 96
+    """
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    _mod.OUTPUT_HOURS     = hours
+    _mod.FORECAST_HORIZON = hours * STEPS_PER_HOUR
+    _mod.MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{hours}h_meiringen.keras')
+    _mod.CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{hours}h_meiringen.npz')
+    print(f"[run_forecast]  hours={hours}  FORECAST_HORIZON={hours * STEPS_PER_HOUR}  "
+          f"MODEL={os.path.basename(_mod.MODEL_PATH)}")
+    run_predict(predict_date, n_weeks=n_weeks, agg_method=agg_method)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='CNN-LSTM load forecast — Meiringen weather source (48h or 96h)',
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Examples:
+  python CNN_LSTM_Meiringen.py --train
+  python CNN_LSTM_Meiringen.py --train --hours 96
+  python CNN_LSTM_Meiringen.py --predict 2026-02-15
+  python CNN_LSTM_Meiringen.py --predict 2026-02-15 --hours 96
+  python CNN_LSTM_Meiringen.py --predict 2026-02-15 --n-weeks 6 --agg-method median
+""")
+    parser.add_argument('--train', action='store_true',
+                        help='Train the model on historical data')
+    parser.add_argument('--predict', type=str, metavar='DATE',
+                        help='Run forecast from DATE (format: YYYY-MM-DD)')
+    parser.add_argument('--hours', type=int, default=OUTPUT_HOURS,
+                        help=f'Forecast horizon in hours (default: {OUTPUT_HOURS}). '
+                             f'Use 48 for Mon-Thu, 96 for Fri-Sun.')
+    parser.add_argument('--n-weeks', type=int, default=HYBRID_N_PAST_WEEKS,
+                        help=f'Same-weekday weeks to look back (default: {HYBRID_N_PAST_WEEKS})')
+    parser.add_argument('--agg-method', type=str, default=HYBRID_AGG_METHOD,
+                        choices=['mean', 'median'],
+                        help=f'Statistical aggregation method (default: {HYBRID_AGG_METHOD})')
+
+    args = parser.parse_args()
+
+    # Override globals when --hours is given
+    if args.hours != OUTPUT_HOURS:
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod.OUTPUT_HOURS     = args.hours
+        _mod.FORECAST_HORIZON = args.hours * STEPS_PER_HOUR
+        _mod.MODEL_PATH  = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Model_{args.hours}h_meiringen.keras')
+        _mod.CONFIG_PATH = os.path.join(SCRIPT_DIR, 'Model', f'CNN_LSTM_Config_{args.hours}h_meiringen.npz')
+        # Update module-level names for functions that read them at call time
+        OUTPUT_HOURS     = _mod.OUTPUT_HOURS
+        FORECAST_HORIZON = _mod.FORECAST_HORIZON
+        MODEL_PATH       = _mod.MODEL_PATH
+        CONFIG_PATH      = _mod.CONFIG_PATH
+        print(f"[--hours {args.hours}]  FORECAST_HORIZON={FORECAST_HORIZON}  "
+              f"MODEL_PATH={os.path.basename(MODEL_PATH)}")
+
+    if args.train:
+        run_train()
+    elif args.predict:
+        run_predict(args.predict,
+                    n_weeks=args.n_weeks,
+                    agg_method=args.agg_method)
+    else:
+        parser.print_help()
