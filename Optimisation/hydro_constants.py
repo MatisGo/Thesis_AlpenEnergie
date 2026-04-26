@@ -51,6 +51,11 @@ RAMP_WINDOW =    3     # 3 × 5 min = 15 min
 TIMESTEP_HOURS = 5 / 60   # 5-minute resolution
 
 # ---------------------------------------------------------------------------
+# Grid exchange peak tariff  (Leistungsentgelt)
+# ---------------------------------------------------------------------------
+PEAK_TARIFF_EUR_KW = 10.0   # EUR per kW of monthly peak import at grid connection
+
+# ---------------------------------------------------------------------------
 # Spill energy loss factor
 # ---------------------------------------------------------------------------
 # Bidmi spill loses M2 energy AND the subsequent M1 cascade energy

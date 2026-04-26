@@ -54,17 +54,21 @@ C1 = COEFF_M2_BIDMI                       # mm of Bidmi drop per kW of M2
 C2 = COEFF_M2_CASCADE + COEFF_M1_HASELHOLZ  # mm of Haselholz rise per kW of M2
 
 
-def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kwargs):
+def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
+                 running_peak_kW=0.0, **_kwargs):
     """
     Rule-based dispatch for one day.
 
-    battery_cfg : BatteryConfig or None.
+    battery_cfg    : BatteryConfig or None.
       If mode == 'INTRADAY', the battery is co-simulated at each timestep:
         - battery_step_forecast() decides charge/discharge from current fill levels
         - turbine target adjusts so net grid export stays = Forecast
         - water balance uses the adjusted turbine output → levels are correct
       Results are written as Batt_* columns; _batt_soc_end is stored as an attribute.
       If mode == 'DAY_AHEAD' or None, battery is ignored here (handled separately).
+    running_peak_kW: highest 15-min avg grid import already seen this calendar month [kW].
+                     In NORMAL state the turbine target is boosted so that grid import
+                     stays at or below this value (peak shaving, priority > forecast).
     """
     day_df   = day_df.reset_index(drop=True)
     N        = len(day_df)
@@ -146,6 +150,20 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None, **_kw
             if t >= RAMP_WINDOW:
                 m1 = max(opt_m1[t - RAMP_WINDOW] - RAMP_MAX,
                          min(opt_m1[t - RAMP_WINDOW] + RAMP_MAX, m1))
+
+        # ── Peak shaving override (highest priority — all states) ────────────
+        # If the state dispatch produced less than the floor needed to keep
+        # grid import ≤ running_peak_kW, boost turbines.
+        # M1 is boosted first: it drains Haselholz (not Bidmi), so it is the
+        # safer choice when Bidmi is already in RECOVERY.
+        peak_floor = demand[t] - (batt_d - batt_c) - running_peak_kW
+        if peak_floor > m2 + m1:
+            extra  = peak_floor - (m2 + m1)
+            m1_add = min(extra, max(0.0, P_MAX_M1 - m1))
+            m1    += m1_add
+            extra -= m1_add
+            if extra > 0:
+                m2 = min(P_MAX_M2, m2 + extra)
 
         # Water balance uses ACTUAL turbine output — levels are always correct
         lb, lh, spill_b, spill_h = water_balance_step(lb, lh, m2, m1, inflow_b[t], inflow_h[t])

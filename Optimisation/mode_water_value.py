@@ -37,7 +37,7 @@ from hydro_constants import (
     BIDMI_RANGE, HASELHOLZ_RANGE,
     BIDMI_LS_PER_MM, HASELHOLZ_LS_PER_MM,
     COEFF_M2_BIDMI, COEFF_M2_CASCADE, COEFF_M1_HASELHOLZ,
-    TURBINE_CASCADE_RATIO,
+    TURBINE_CASCADE_RATIO, PEAK_TARIFF_EUR_KW,
     water_balance_step, spill_to_kwh, attach_common_results,
 )
 from battery_control import (
@@ -73,7 +73,8 @@ def get_solver():
 # ---------------------------------------------------------------------------
 
 def _build_model(N, forecast, id_price, inflow_b, inflow_h,
-                 lb0, lh0, target_lb, target_lh, battery_cfg=None):
+                 lb0, lh0, target_lb, target_lh, battery_cfg=None,
+                 running_peak_kW=0.0, demand=None):
     """
     Build the WATER_VALUE LP.
 
@@ -174,7 +175,34 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         m.imbalance_con = Constraint(m.T, rule=lambda m, t:
             m.dev_pos[t] - m.dev_neg[t] == m.P_M2[t] + m.P_M1[t] - forecast[t])
 
-    # Objective — minimise ID imbalance cost + terminal penalties
+    # -----------------------------------------------------------------------
+    # Grid import peak tariff (Leistungsentgelt)
+    # P_import[t] = max(0, demand[t] - local_generation[t])
+    # 15-min blocks: 3 consecutive 5-min steps.
+    # excess_peak >= avg(P_import in block b) - running_peak_kW  ∀ b
+    # Objective penalty: PEAK_TARIFF_EUR_KW × excess_peak
+    # -----------------------------------------------------------------------
+    load = demand if demand is not None else [0.0] * N
+    B_BLOCKS = N // 3
+
+    m.P_import = Var(m.T, domain=NonNegativeReals)
+    if with_battery:
+        m.import_def = Constraint(m.T, rule=lambda m, t:
+            m.P_import[t] >= load[t] - (m.P_M2[t] + m.P_M1[t]) - (m.batt_d[t] - m.batt_c[t]))
+    else:
+        m.import_def = Constraint(m.T, rule=lambda m, t:
+            m.P_import[t] >= load[t] - (m.P_M2[t] + m.P_M1[t]))
+
+    m.excess_peak = Var(domain=NonNegativeReals)
+    if B_BLOCKS > 0:
+        m.peak_block = Constraint(
+            list(range(B_BLOCKS)),
+            rule=lambda m, b: m.excess_peak >= (
+                m.P_import[3 * b] + m.P_import[3 * b + 1] + m.P_import[3 * b + 2]
+            ) / 3.0 - running_peak_kW,
+        )
+
+    # Objective — minimise ID imbalance cost + terminal penalties + peak tariff
     imbalance_cost = sum(
         abs(id_price[t]) * (m.dev_pos[t] + m.dev_neg[t]) * TIMESTEP_HOURS / 1000.0
         for t in m.T)
@@ -183,7 +211,8 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         - PW_SLOPE3 * (m.pw_b3 + m.pw_h3)
         - PW_SLOPE4 * (m.pw_b4 + m.pw_h4)
     )
-    m.obj = Objective(expr=-imbalance_cost + penalties, sense=maximize)
+    peak_penalty = PEAK_TARIFF_EUR_KW * m.excess_peak
+    m.obj = Objective(expr=-imbalance_cost + penalties - peak_penalty, sense=maximize)
     return m
 
 
@@ -192,13 +221,15 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
 # ---------------------------------------------------------------------------
 
 def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
-                 solver=None, battery_cfg=None, **_kwargs):
+                 solver=None, battery_cfg=None, running_peak_kW=0.0, **_kwargs):
     """
-    battery_cfg : BatteryConfig or None.
+    battery_cfg    : BatteryConfig or None.
       'INTRADAY' mode → battery vars added to LP; LP jointly minimises
                         ID imbalance on net grid export (hydro + battery).
                         Battery columns and _batt_soc_end written to day_df.
       'DAY_AHEAD' mode or None → battery_cfg ignored here; handled separately.
+    running_peak_kW: current monthly peak import already observed [kW].
+                     The LP will only be penalised for exceeding this value.
     """
     day_df      = day_df.reset_index(drop=True)
     N           = len(day_df)
@@ -212,7 +243,8 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
 
     model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
                           lb0, lh0, target_lb, target_lh,
-                          battery_cfg=battery_cfg if with_batt else None)
+                          battery_cfg=battery_cfg if with_batt else None,
+                          running_peak_kW=running_peak_kW, demand=demand)
     result = solver.solve(model, tee=False)
     status = str(result.solver.termination_condition)
 

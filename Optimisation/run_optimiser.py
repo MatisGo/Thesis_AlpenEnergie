@@ -16,7 +16,7 @@ import sys
 import pandas as pd
 
 from hydro_constants import (
-    DATA_FILENAME, TIMESTEP_HOURS,
+    DATA_FILENAME, TIMESTEP_HOURS, PEAK_TARIFF_EUR_KW,
     load_data, compute_seasonal_targets, compute_seasonal_production,
 )
 
@@ -41,7 +41,7 @@ MODE = 'WATER_VALUE'
 #                     'HYBRID'    — INTRADAY + optional DA block when SOC > floor & price OK
 #
 BATTERY_ACTIVE = True
-BATTERY_MODE   = 'INTRADAY'  # 'DAY_AHEAD', 'INTRADAY', 'HYBRID'
+BATTERY_MODE   = 'INTRADAY'  # 'DAY_AHEAD', 'INTRADAY'
 
 # ---------------------------------------------------------------------------
 #  FINANCIAL PARAMETERS  (battery investment analysis)
@@ -189,8 +189,17 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
     total_da_delivery_kwh = 0.0  # kWh actually delivered via DA blocks
     da_block_days         = 0    # number of days a DA block was executed
 
+    # Monthly peak import state (Leistungsentgelt)
+    running_peak_kW = 0.0   # highest 15-min avg import seen so far this calendar month
+    current_month   = None  # track month boundary for reset
+
     for i, day in enumerate(days, 1):
         day_df = df[df['DateTime'].dt.date == day].copy()
+
+        # Reset monthly peak at calendar month boundary
+        if day.month != current_month:
+            running_peak_kW = 0.0
+            current_month   = day.month
 
         t_lb, t_lh = season_targets.get(day, (None, None))
 
@@ -228,6 +237,7 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
             solver=solver,
             battery_cfg=battery_cfg,
             seasonal_prod=seas_prod,
+            running_peak_kW=running_peak_kW,
         )
 
         # Read hydro chain attributes before any reset_index can drop them
@@ -287,6 +297,34 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
             batt_rev     = day_df['Batt_Revenue_EUR'].sum()
             batt_str     = f"  batt {batt_rev:+.2f} EUR  cyc {cycles_today:.2f}"
 
+        # -----------------------------------------------------------------------
+        # Grid exchange power columns
+        # P_Exchange_kW > 0 → importing from grid; < 0 → exporting to grid
+        # -----------------------------------------------------------------------
+        batt_net = day_df['Batt_Net_kW'] if 'Batt_Net_kW' in day_df.columns else 0.0
+        day_df['P_Exchange_kW'] = (
+            day_df['Consumption_kW'] - day_df['Opt_M2_kW'] - day_df['Opt_M1_kW'] - batt_net
+        )
+        day_df['P_Import_kW'] = day_df['P_Exchange_kW'].clip(lower=0.0)
+
+        # 15-min block average import (3 consecutive 5-min steps per block)
+        N_day      = len(day_df)
+        p_import   = day_df['P_Import_kW'].values
+        B_BLOCKS   = N_day // 3
+        p15_expanded = []
+        for b in range(B_BLOCKS):
+            val = float(p_import[3 * b] + p_import[3 * b + 1] + p_import[3 * b + 2]) / 3.0
+            p15_expanded.extend([val, val, val])
+        remainder = N_day - 3 * B_BLOCKS
+        if remainder > 0:
+            val = float(p_import[3 * B_BLOCKS:].mean())
+            p15_expanded.extend([val] * remainder)
+        day_df['P_Import_15min_kW'] = p15_expanded
+
+        # Update running monthly peak
+        day_max_peak_15min = max(p15_expanded) if p15_expanded else 0.0
+        running_peak_kW    = max(running_peak_kW, day_max_peak_15min)
+
         # Console progress
         opt_profit = day_df['Opt_Energy_Trading_EUR'].sum()
         ref_profit = day_df['Ref_Energy_Trading_EUR'].sum()
@@ -299,7 +337,8 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
               f"ref {ref_profit:+.2f} EUR  opt {opt_profit:+.2f} EUR  "
               f"gain {gain:+.2f} EUR  "
               f"dLB={dev_b:+.1f}mm dLH={dev_h:+.1f}mm"
-              f"{spill_str}{batt_str}")
+              f"{spill_str}{batt_str}"
+              f"  peak {day_max_peak_15min:.0f} kW")
 
         failed_days += getattr(day_df, '_failed', 0)
         results.append(day_df)
@@ -336,6 +375,27 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
     total_spill_b   = opt_df['Opt_Spill_Bidmi_kWh'].sum()
     total_spill_h   = opt_df['Opt_Spill_Haselholz_kWh'].sum()
     total_spill     = total_spill_b + total_spill_h
+
+    # Monthly peak import tariff (Leistungsentgelt)
+    peak_rows = []
+    total_peak_cost = 0.0
+    if 'P_Import_15min_kW' in opt_df.columns:
+        opt_df['Month_key'] = opt_df['DateTime'].dt.to_period('M')
+        monthly_peak = opt_df.groupby('Month_key')['P_Import_15min_kW'].max()
+        monthly_cost = monthly_peak * PEAK_TARIFF_EUR_KW
+        total_peak_cost = monthly_cost.sum()
+        opt_df.drop(columns=['Month_key'], inplace=True)
+
+        peak_rows = [('--- Grid Import Peak Tariff (Leistungsentgelt) ---', '', '')]
+        for period, pk_kw, pk_eur in zip(monthly_peak.index,
+                                          monthly_peak.values,
+                                          monthly_cost.values):
+            peak_rows.append((str(period), f'{pk_kw:.1f} kW  →  {pk_eur:.2f}', 'EUR'))
+        peak_rows += [
+            ('Total peak tariff cost', f'{total_peak_cost:,.2f}',   'EUR'),
+            ('Tariff rate',            f'{PEAK_TARIFF_EUR_KW:.1f}', 'EUR/kW/month'),
+            ('', '', ''),
+        ]
 
     # Forecast drift (FORECAST and WATER_VALUE modes)
     drift_rows = []
@@ -436,6 +496,7 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         ('Optimised energy',   f'{opt_energy_kwh:,.0f}',  'kWh'),
         ('Difference',         f'{energy_diff:+,.0f}',    'kWh'),
         ('', '', ''),
+        *peak_rows,
         *drift_rows,
         ('--- Spillage Losses ---', '', ''),
         ('Bidmi spillage',     f'{total_spill_b:,.0f}',  'kWh'),
@@ -465,6 +526,8 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
     print(f"  Ref energy        : {ref_energy_kwh/1000:,.1f} MWh")
     print(f"  Opt energy        : {opt_energy_kwh/1000:,.1f} MWh")
     print(f"  Total spill loss  : {total_spill/1000:,.1f} MWh")
+    if peak_rows:
+        print(f"  Peak tariff cost  : {total_peak_cost:+,.2f} EUR")
     if drift_rows:
         print(f"  Forecast MAE      : {mae_kw:.1f} kW")
         print(f"  Cumulative drift  : {drift_kwh/1000:+,.1f} MWh")
@@ -514,6 +577,7 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         'Capacity_EOL_pct':    capacity_end_life           if batt_rows else 0,
         'DA_Block_Days':        da_block_days           if batt_rows else '-',
         'DA_Delivery_Pct':     round(da_pct, 1)        if batt_rows else '-',
+        'Peak_Tariff_EUR':     round(total_peak_cost, 2),
         'Failed_Days':         getattr(opt_df, '_failed_days', 0),
         'Output_File':         os.path.basename(output_path),
     }

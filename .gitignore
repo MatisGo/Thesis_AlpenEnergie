@@ -1,0 +1,18 @@
+# Large data files — kept locally, not pushed to GitHub
+Cons_Prediction/CNN_LSTM/Ressource/Meiringen.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Excel lock files
+~$*.xlsx
+~$*.xls

@@ -14,9 +14,9 @@ Architecture (based on Chung & Jang 2022, Khan et al. 2020):
   Decoder conditioning (3 inputs merged):
     - Input 2: Same-weekday statistical profiles (past 4 weeks, 576×4)
     - Input 3: Estimated PV production for forecast horizon (576×1)
-      Built via Lorenz (2011) / Bacher (2009) correction table:
-        PV_Est = Irr_FC × ratio[month, 15min_slot]
-      ratio table is pre-computed from 2 years of PV production data.
+      Built via a trained MLP (PV_NN_Model.keras):
+        PV_Est = MLP(GHI, Cloud, Temp, Rain, Month_sin/cos, Hour_sin/cos, PV_t1, PV_t4)
+      Replaces the static Lorenz (2011) correction table with a learned model.
   Decoder:
     - RepeatVector + LSTM decoder + TimeDistributed Dense
     - Outputs (48 hours, 12 steps each) then flattened to 576 steps
@@ -24,21 +24,23 @@ Architecture (based on Chung & Jang 2022, Khan et al. 2020):
 Input 1 - Encoder (7-day lookback, 2016 steps x 12 features):
   Load_Is (past), Load_yesterday, Load_last_week,
   Hour_sin, Hour_cos, Weekday_sin, Weekday_cos,
-  PHolyday, Temp_Forecast, Rain_Forecast,
-  Irr_FC    ← API irradiance forecast (GHI from Open-Meteo, consistent source for encoder)
+  PHolyday, Temp_Forecast, Rain_Forecast, Irr_FC, Cloud_Cover
 
-Input 2 - Decoder conditioning (576 steps x 4 weekly profiles):
-  Load from same weekday 1w, 2w, 3w, 4w ago for each forecast step
+Input 2 - Decoder conditioning (576 steps x 8 weekly profiles):
+  Load from same weekday 1w…8w ago for each forecast step
 
 Input 3 - PV estimate for forecast horizon (576 steps x 1):
-  Estimated PV production (kW) using irradiance forecast × correction table
+  Estimated PV production (kW) from trained deep MLP (PV_NN_Model.keras)
+  Features: GHI, Cloud, Temp, Rain, Month_sin/cos, Hour_sin/cos,
+            GHI_effective, GHI_sq, GHI_x_hour_sin/cos, Season one-hot
+  Replaces the static Lorenz (2011) correction table with a learned model.
 
 Output: Load_Is for the next 48 hours (576 steps at 5-min resolution)
 Loss:   Huber (less sensitive to spikes than MSE)
 
 References:
-  Lorenz et al. (2011) DOI: 10.1002/pip.1033
-  Bacher et al. (2009) DOI: 10.1016/j.solener.2009.05.016
+  Grinsztajn et al. (2022) NeurIPS, arXiv:2207.08815  (MLP vs CNN for tabular data)
+  Lorenz et al. (2011) DOI: 10.1002/pip.1033          (PV forecasting, AR features)
 
 Usage:
   python CNN_LSTM_Prediction.py --train
@@ -47,6 +49,7 @@ Usage:
 
 import argparse
 import os
+import pickle
 import time
 import numpy as np
 import pandas as pd
@@ -62,7 +65,7 @@ from tensorflow.keras.layers import (Conv1D, MaxPooling1D, LSTM, Dense,
                                       Dropout, BatchNormalization, Input,
                                       RepeatVector, TimeDistributed, Reshape,
                                       Flatten, Concatenate, Permute, Dot,
-                                      Multiply, Activation, Lambda)
+                                      Multiply, Activation, Rescaling)
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
@@ -74,8 +77,9 @@ from tensorflow.keras.losses import Huber
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR   = os.path.join(SCRIPT_DIR, '..', 'Output Forecast')
 DATA_PATH     = os.path.join(SCRIPT_DIR, 'Ressource', 'Data_Prediction.xlsx')
-WEATHER_PATH  = os.path.join(SCRIPT_DIR, 'Ressource', 'Imported_Forecast.xlsx')
-PV_TABLE_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_Correction_Table.npz')
+WEATHER_PATH     = os.path.join(SCRIPT_DIR, 'Ressource', 'Imported_Forecast.xlsx')
+PV_NN_MODEL_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_NN_Model.keras')
+PV_NN_SCALER_PATH = os.path.join(SCRIPT_DIR, 'PV_Correction', 'PV_NN_Scaler.pkl')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -94,7 +98,12 @@ STEP_SIZE = 6               # Sample every 30 min (reduces memory, keeps enough 
 METADATA_ROWS = 2           # Rows to skip in xlsx (Einheit, Signalname)
 TEST_DAYS = 10              # Last N days held out for testing
 
-# Input features (order matters - must match during prediction)
+# Input features — encoder (7-day lookback, 12 features).
+# PV_Est is intentionally NOT listed here.  It is a known future exogenous
+# variable (computed from the weather forecast for the next 48 h) and belongs
+# at the DECODER stage as Input 3, not in the encoder's historical window.
+# The encoder already receives Irr_FC and Cloud_Cover, which carry the
+# irradiance context the LSTM needs to build a PV-aware load representation.
 INPUT_FEATURES = [
     'Load_Is',              # Past load values (net load = gross - PV)
     'Load_yesterday',       # Load at same time 24h ago (lagged feature)
@@ -106,8 +115,8 @@ INPUT_FEATURES = [
     'PHolyday',             # Public holiday flag (0/1)
     'Temp_Forecast',        # Temperature forecast (deg C)
     'Rain_Forecast',        # Rain forecast (mm)
-    'Irr_FC',               # API irradiance forecast (W/m²) - GHI from Open-Meteo, solar context for encoder
-    'Cloud_Cover',          # Total cloud cover (%) - key signal for PV output variance
+    'Irr_FC',               # API irradiance forecast (W/m²)
+    'Cloud_Cover',          # Total cloud cover (%)
 ]
 TARGET = 'Load_Is'
 
@@ -143,35 +152,33 @@ STAT_N_WEEKS = 8               # Number of past same-weekday profiles fed to dec
 
 
 # =============================================================================
-# PV CORRECTION TABLE
+# PV DEEP NN — load trained MLP model + scaler
 # =============================================================================
 
-def load_pv_correction_table():
+def load_pv_nn_model():
     """
-    Load the pre-computed irradiance-to-PV correction table.
+    Load the trained PV MLP model and its feature/target scalers.
 
-    The table was built by Build_PV_Correction_Table.py from 2 years of
-    measured PV production and co-located irradiance forecast data,
-    following the Lorenz (2011) / Bacher (2009) approach.
+    The model was trained by PV_Correction/Train_PV_NN.py on 2+ years of
+    15-min PV production data matched with Open-Meteo ERA5 weather.
 
     Returns
     -------
-    ratio_table : np.ndarray, shape (12, 96)
-        ratio_table[month-1, slot] = kW per (W/m²)
-        where slot is the 15-min slot index (0 = 00:00, 95 = 23:45).
-        Returns None if the file does not exist (PV feature disabled).
+    dict with keys 'model', 'scaler_X', 'scaler_y', or None if files missing.
     """
-    if not os.path.exists(PV_TABLE_PATH):
-        print(f"WARNING: PV correction table not found at {PV_TABLE_PATH}")
-        print("  Run Build_PV_Correction_Table.py first to enable PV conditioning.")
+    if not os.path.exists(PV_NN_MODEL_PATH) or not os.path.exists(PV_NN_SCALER_PATH):
+        print(f"WARNING: PV NN model not found at {PV_NN_MODEL_PATH}")
+        print("  Run PV_Correction/Train_PV_NN.py first to enable PV NN conditioning.")
         print("  Training will proceed WITHOUT PV input (Irr_FC still in encoder).")
         return None
 
-    data = np.load(PV_TABLE_PATH)
-    ratio_table = data['ratio_table'].astype(np.float32)  # (12, 96)
-    print(f"  PV correction table loaded: shape={ratio_table.shape}, "
-          f"max_ratio={ratio_table.max():.4f}")
-    return ratio_table
+    pv_model = load_model(PV_NN_MODEL_PATH)
+    with open(PV_NN_SCALER_PATH, 'rb') as f:
+        scalers = pickle.load(f)
+
+    print(f"  PV NN model loaded: {PV_NN_MODEL_PATH}")
+    return {'model': pv_model, 'scaler_X': scalers['scaler_X'],
+            'scaler_y': scalers['scaler_y']}
 
 
 # =============================================================================
@@ -200,7 +207,7 @@ def _load_weather(path: str) -> pd.DataFrame:
     return df_w[['DateTime', 'Temperature_C', 'Irradiance_Wm2', 'Rain_Sum_mm', 'Cloud_Cover_Pct']]
 
 
-def load_data(ratio_table=None):
+def load_data(pv_nn=None):
     """
     Load and preprocess data from two sources:
       1. Data_Prediction.xlsx  — historical load, real sensor values (Irr_Real),
@@ -217,7 +224,8 @@ def load_data(ratio_table=None):
       - Future rows (beyond Data_Prediction) → calendar features computed from DateTime,
         Load_Is = NaN (enables 48h prediction beyond data end).
 
-    Also computes PV_Est = Irr_FC × ratio_table[month, slot] if table is provided.
+    Computes PV_Est via the trained weather-only PV MLP (pv_nn dict) if provided, otherwise 0.
+    Single deterministic pass — no AR features, no exposure bias.
     """
     # -------------------------------------------------------------------------
     # 1. Load Data_Prediction.xlsx (historical: load, real sensors, calendar)
@@ -315,15 +323,59 @@ def load_data(ratio_table=None):
     df['Load_last_week'] = df['Load_Is'].shift(2016).bfill()
 
     # -------------------------------------------------------------------------
-    # 6. PV estimate via Lorenz (2011) correction table
+    # 6. PV estimate via trained MLP (replaces Lorenz correction table)
     # -------------------------------------------------------------------------
-    if ratio_table is not None:
-        months = df['DateTime'].dt.month.values - 1
-        slots  = (df['DateTime'].dt.hour * 4 +
-                  df['DateTime'].dt.minute // 15).values
-        slots  = np.clip(slots, 0, 95)
-        ratio_per_step = ratio_table[months, slots]
-        df['PV_Est'] = (df['Irr_FC'].values * ratio_per_step).astype(np.float32)
+    if pv_nn is not None:
+        pv_model  = pv_nn['model']
+        scaler_X  = pv_nn['scaler_X']
+        scaler_y  = pv_nn['scaler_y']
+
+        # Feature matrix — must match FEATURE_COLS in Train_PV_NN.py exactly.
+        # Includes 4 physics interaction features (same computation as build_features()).
+        month = df['DateTime'].dt.month.values
+        hour  = (df['DateTime'].dt.hour.values +
+                 df['DateTime'].dt.minute.values / 60.0)
+
+        ghi      = df['Irr_FC'].values.astype(np.float32)
+        cc       = df['Cloud_Cover'].values.astype(np.float32)
+        hour_sin = np.sin(2 * np.pi * hour / 24).astype(np.float32)
+        hour_cos = np.cos(2 * np.pi * hour / 24).astype(np.float32)
+
+        # Season one-hot flags — must match build_features() in Train_PV_NN.py
+        season_winter = np.isin(month, [12, 1, 2]).astype(np.float32)
+        season_spring = np.isin(month, [3, 4, 5]).astype(np.float32)
+        season_summer = np.isin(month, [6, 7, 8]).astype(np.float32)
+        season_autumn = np.isin(month, [9, 10, 11]).astype(np.float32)
+
+        feat_mat = np.column_stack([
+            ghi,                                                    # GHI_Wm2
+            cc,                                                     # Cloud_Cover
+            df['Temp_Forecast'].values.astype(np.float32),         # Temperature_C
+            df['Rain_Forecast'].values.astype(np.float32),         # Precip_mm
+            np.sin(2 * np.pi * month / 12).astype(np.float32),    # Month_sin
+            np.cos(2 * np.pi * month / 12).astype(np.float32),    # Month_cos
+            hour_sin,                                               # Hour_sin
+            hour_cos,                                               # Hour_cos
+            (ghi * (1.0 - cc / 100.0)),                            # GHI_effective
+            ((ghi / 1000.0) ** 2),                                  # GHI_sq
+            (ghi * hour_sin / 1000.0),                             # GHI_x_hour_sin
+            (ghi * hour_cos / 1000.0),                             # GHI_x_hour_cos
+            season_winter,                                          # Season_Winter
+            season_spring,                                          # Season_Spring
+            season_summer,                                          # Season_Summer
+            season_autumn,                                          # Season_Autumn
+        ])
+
+        feat_mat_s = scaler_X.transform(feat_mat)
+        pv_s       = pv_model.predict(feat_mat_s, batch_size=4096, verbose=0)
+        df['PV_Est'] = scaler_y.inverse_transform(pv_s).flatten().clip(min=0.0).astype(np.float32)
+
+        # Nighttime shortcut: model was trained on daytime samples only (GHI > 10 W/m²).
+        # Force PV_Est = 0 for nighttime rows — physically correct and consistent
+        # with the training distribution (avoids out-of-distribution inputs).
+        IRR_THRESHOLD = 10.0  # W/m² — must match IRR_TRAIN_THRESHOLD in Train_PV_NN.py
+        night_mask = ghi < IRR_THRESHOLD
+        df.loc[night_mask, 'PV_Est'] = 0.0
     else:
         df['PV_Est'] = 0.0
 
@@ -548,8 +600,8 @@ def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
     # Scaled dot-product scores: query · keysᵀ / √d
     scores  = Dot(axes=[2, 2], name='attn_scores')([query_3d, week_keys])            # (batch, 1, n_weeks)
     scores  = Flatten()(scores)                                                       # (batch, n_weeks)
-    scores  = Lambda(lambda s: s / tf.math.sqrt(float(ATTN_DIM)),
-                     name='attn_scale')(scores)                                       # (batch, n_weeks)
+    scores  = Rescaling(scale=1.0 / np.sqrt(float(ATTN_DIM)),
+                       name='attn_scale')(scores)                                     # (batch, n_weeks)
     attn_w  = Activation('softmax', name='week_attention')(scores)                   # (batch, n_weeks)
 
     # Weighted sum of the n_weeks profiles → single attended profile
@@ -946,10 +998,10 @@ def run_train():
     print("CNN-LSTM 48h LOAD PREDICTION - TRAINING")
     print("=" * 70)
 
-    # 1. Load PV correction table + data
+    # 1. Load PV NN model + data
     print("\n--- Step 1: Loading Data ---")
-    ratio_table = load_pv_correction_table()
-    df = load_data(ratio_table=ratio_table)
+    pv_nn = load_pv_nn_model()
+    df = load_data(pv_nn=pv_nn)
 
     # 2. Create sequences (only from rows with valid Load_Is)
     print("\n--- Step 2: Creating Sequences ---")
@@ -1143,10 +1195,10 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
     scaler_X, scaler_y, scaler_stat, scaler_pv = load_config()
     n_feat = len(INPUT_FEATURES)
 
-    # 3. Load PV correction table + data
+    # 3. Load PV NN model + data
     print("\n--- Loading data ---")
-    ratio_table = load_pv_correction_table()
-    df = load_data(ratio_table=ratio_table)
+    pv_nn = load_pv_nn_model()
+    df = load_data(pv_nn=pv_nn)
 
     # 4. Find prediction start point
     pred_date = pd.to_datetime(date_str)
@@ -1177,7 +1229,7 @@ def run_predict(date_str, n_weeks=HYBRID_N_PAST_WEEKS, agg_method=HYBRID_AGG_MET
     print(f"  Stat profile built: {stat_profile.shape}")
 
     # 5c. Extract PV estimate for forecast horizon (Input 3)
-    # PV_Est was already computed in load_data() via the correction table
+    # PV_Est was already computed in load_data() via the PV NN model
     end_pv = min(idx + FORECAST_HORIZON, len(df))
     pv_slice = df['PV_Est'].values[idx:end_pv].astype(np.float32)
     # Pad with zeros if forecast period extends beyond data

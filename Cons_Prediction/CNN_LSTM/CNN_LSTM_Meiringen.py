@@ -48,7 +48,7 @@ from tensorflow.keras.layers import (Conv1D, MaxPooling1D, LSTM, Dense,
                                       Dropout, BatchNormalization, Input,
                                       RepeatVector, TimeDistributed, Reshape,
                                       Flatten, Concatenate, Permute, Dot,
-                                      Multiply, Activation, Lambda)
+                                      Multiply, Activation, Rescaling)
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import Huber
@@ -579,8 +579,8 @@ def build_model(input_shape, stat_shape, pv_shape, output_hours=None,
     # Scaled dot-product scores: query · keysᵀ / √d
     scores  = Dot(axes=[2, 2], name='attn_scores')([query_3d, week_keys])            # (batch, 1, n_weeks)
     scores  = Flatten()(scores)                                                       # (batch, n_weeks)
-    scores  = Lambda(lambda s: s / tf.math.sqrt(float(ATTN_DIM)),
-                     name='attn_scale')(scores)                                       # (batch, n_weeks)
+    scores  = Rescaling(scale=1.0 / np.sqrt(float(ATTN_DIM)),
+                       name='attn_scale')(scores)                                     # (batch, n_weeks)
     attn_w  = Activation('softmax', name='week_attention')(scores)                   # (batch, n_weeks)
 
     # Weighted sum of the n_weeks profiles → single attended profile
