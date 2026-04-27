@@ -38,7 +38,6 @@ MODE = 'WATER_VALUE'
 #                     False — hydro only
 #   BATTERY_MODE    : 'DAY_AHEAD' — buy low / sell high on the DA market (LP)
 #                     'INTRADAY'  — reservoir-triggered co-simulation (reduces intraday imbalance)
-#                     'HYBRID'    — INTRADAY + optional DA block when SOC > floor & price OK
 #
 BATTERY_ACTIVE = True
 BATTERY_MODE   = 'INTRADAY'  # 'DAY_AHEAD', 'INTRADAY'
@@ -61,26 +60,6 @@ DISCOUNT_RATE           = 0.05     # —
 BATTERY_DEG_PER_CYCLE   = 0.00005    # fraction/cycle  (0.005 %/cycle)
 BATTERY_OM_EUR_KWH_YEAR = 8.0     # EUR/kWh/year (8 could be default)
 
-# ---------------------------------------------------------------------------
-#  HYBRID BATTERY MODE TUNING  (active only when BATTERY_MODE = 'HYBRID')
-# ---------------------------------------------------------------------------
-#
-#   HYBRID_BLOCK_FILL_PCT : fraction of the usable SOC range [SOC_MIN .. SOC_MAX]
-#                           above which the DA block is triggered.
-#                           e.g. 0.80 with [20, 180] kWh → floor = 20 + 0.80×160 = 148 kWh
-#                           Energy above the floor is reserved for DA delivery.
-#
-#   HYBRID_MIN_DA_PRICE   : minimum next-day PEAK DA price [EUR/MWh] required
-#                           to activate the block.  Below this threshold the
-#                           battery stays in pure INTRADAY mode for that day.
-#
-#   HYBRID_BID_HOUR       : Hour of day (0–23) at which the SOC check is
-#                           performed and the DA bid is locked in.
-#                           Default = 12 (noon) — matches the real DA auction.
-#
-HYBRID_BLOCK_FILL_PCT = 0.80     # fraction of usable range
-HYBRID_MIN_DA_PRICE   = 50.0     # EUR/MWh
-HYBRID_BID_HOUR       = 8       # 0-23
 # ===========================================================================
 
 def _make_output_filename():
@@ -89,7 +68,7 @@ def _make_output_filename():
     if not BATTERY_ACTIVE:
         batt_str = 'NoBatt'
     else:
-        batt_short = {'DAY_AHEAD': 'DA', 'INTRADAY': 'ID', 'HYBRID': 'HYB'}.get(BATTERY_MODE, BATTERY_MODE)
+        batt_short = {'DAY_AHEAD': 'DA', 'INTRADAY': 'ID'}.get(BATTERY_MODE, BATTERY_MODE)
         mwh = int(round(CAPACITY_KWH / 1000))
         batt_str = f'{batt_short}_{mwh}MWh'
     return f'{mode_short}_{batt_str}.xlsx'
@@ -111,49 +90,6 @@ if BATTERY_ACTIVE:
         SOC_INITIAL, CYCLE_KWH, CAPACITY_KWH, ROUND_TRIP_EFF, C_RATE,
         SOC_MIN, SOC_MAX, EFF_DISCHARGE, _P_MAX_BATT,
     )
-
-
-# ---------------------------------------------------------------------------
-# HYBRID helpers
-# ---------------------------------------------------------------------------
-
-def _get_da_floor():
-    """DA block floor SOC [kWh]: INTRADAY zone ceiling when a block is active."""
-    return SOC_MIN + HYBRID_BLOCK_FILL_PCT * (SOC_MAX - SOC_MIN)
-
-
-def _apply_da_delivery(day_df, commit_kwh, peak_t):
-    """
-    Apply committed DA energy delivery starting at peak_t.
-
-    commit_kwh : kWh stored in battery (SOC units) reserved for DA sale.
-                 Grid receives commit_kwh × EFF_DISCHARGE kWh.
-    peak_t     : timestep index with the highest DA price (delivery start).
-
-    Adds to Batt_Discharge_kW, Batt_Net_kW, and Batt_Revenue_EUR.
-    The SOC column is NOT modified — it reflects the INTRADAY zone only.
-
-    Returns grid kWh delivered (added to cycle counter).
-    """
-    dt             = TIMESTEP_HOURS
-    n              = len(day_df)
-    grid_kwh_total = commit_kwh * EFF_DISCHARGE       # kWh sent to grid
-    remaining_kwh  = grid_kwh_total
-
-    t = peak_t
-    while remaining_kwh > 1e-6 and t < n:
-        grid_kw    = min(_P_MAX_BATT, remaining_kwh / dt)
-        da_price_t = float(day_df.loc[t, 'Day_Ahead_Price_EUR_MWh'])
-        revenue    = grid_kw * da_price_t * dt / 1000.0
-
-        day_df.loc[t, 'Batt_Discharge_kW'] = float(day_df.loc[t, 'Batt_Discharge_kW']) + grid_kw
-        day_df.loc[t, 'Batt_Net_kW']       = float(day_df.loc[t, 'Batt_Net_kW'])       + grid_kw
-        day_df.loc[t, 'Batt_Revenue_EUR']  = float(day_df.loc[t, 'Batt_Revenue_EUR'])  + revenue
-
-        remaining_kwh -= grid_kw * dt
-        t += 1
-
-    return grid_kwh_total
 
 
 # ---------------------------------------------------------------------------
@@ -180,14 +116,10 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
             print(f"ERROR: date '{target_date}' not found in data.")
             sys.exit(1)
 
-    days_set    = set(days)
     results     = []
     prev_lb     = None
     prev_lh     = None
     failed_days = 0
-    da_block             = {}    # date → {'commit_kwh': float, 'peak_t': int}  (HYBRID only)
-    total_da_delivery_kwh = 0.0  # kWh actually delivered via DA blocks
-    da_block_days         = 0    # number of days a DA block was executed
 
     # Monthly peak import state (Leistungsentgelt)
     running_peak_kW = 0.0   # highest 15-min avg import seen so far this calendar month
@@ -210,23 +142,10 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         lh0 = prev_lh if prev_lh is not None else float(day_df['Haselholz_mm'].iloc[0])
 
         # Build battery config for this day (carries today's starting SOC).
-        # INTRADAY / HYBRID battery is co-simulated inside dispatch_day.
+        # INTRADAY battery is co-simulated inside dispatch_day.
         # DAY_AHEAD battery is fully independent → dispatch_day ignores it.
-        # HYBRID with active block: INTRADAY zone is capped at DA floor so
-        #   committed energy stays reserved until delivery.
         if BATTERY_ACTIVE:
-            if BATTERY_MODE == 'HYBRID':
-                block_today = da_block.get(day)
-                if block_today:
-                    da_floor      = _get_da_floor()
-                    soc0_intraday = min(prev_soc, da_floor)
-                    battery_cfg   = BatteryConfig(mode='HYBRID', soc0=soc0_intraday,
-                                                  soc_max_override=da_floor)
-                else:
-                    battery_cfg = BatteryConfig(mode='HYBRID', soc0=prev_soc,
-                                                soc_max_override=None)
-            else:
-                battery_cfg = BatteryConfig(mode=BATTERY_MODE, soc0=prev_soc)
+            battery_cfg = BatteryConfig(mode=BATTERY_MODE, soc0=prev_soc)
         else:
             battery_cfg = None
 
@@ -249,44 +168,10 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
         # Battery post-dispatch
         batt_str = ""
         if BATTERY_ACTIVE:
-            if BATTERY_MODE in ('INTRADAY', 'HYBRID'):
+            if BATTERY_MODE == 'INTRADAY':
                 # Co-simulation already done inside dispatch_day.
                 prev_soc       = getattr(day_df, '_batt_soc_end', prev_soc)
                 discharged_kwh = day_df['Batt_Discharge_kW'].sum() * TIMESTEP_HOURS
-
-                if BATTERY_MODE == 'HYBRID':
-                    # 1. Apply any DA delivery committed from yesterday
-                    block_today = da_block.get(day)
-                    if block_today:
-                        extra_kwh              = _apply_da_delivery(
-                            day_df, block_today['commit_kwh'], block_today['peak_t'])
-                        discharged_kwh        += extra_kwh
-                        total_da_delivery_kwh += extra_kwh
-                        da_block_days         += 1
-                        # prev_soc = INTRADAY end (committed zone delivered, already excluded
-                        # from INTRADAY dispatch via soc_max_override)
-
-                    # 2. Check if conditions for a new DA block (delivery tomorrow) are met
-                    tomorrow = day + _dt.timedelta(days=1)
-                    if tomorrow in days_set and tomorrow not in da_block:
-                        bid_t = HYBRID_BID_HOUR * (60 // 5)   # 12 × 12 = 144 for noon
-                        if bid_t < len(day_df):
-                            soc_at_bid = float(day_df['Batt_SOC_kWh'].iloc[bid_t])
-                            da_floor   = _get_da_floor()
-                            if soc_at_bid > da_floor:
-                                next_day_df = df[df['DateTime'].dt.date == tomorrow]
-                                next_prices = next_day_df['Day_Ahead_Price_EUR_MWh'].tolist()
-                                if next_prices:
-                                    peak_price = max(next_prices)
-                                    if peak_price >= HYBRID_MIN_DA_PRICE:
-                                        commit_kwh = soc_at_bid - da_floor
-                                        peak_t     = int(pd.Series(next_prices).idxmax())
-                                        da_block[tomorrow] = {
-                                            'commit_kwh': commit_kwh,
-                                            'peak_t':     peak_t,
-                                        }
-                                        print(f"  [HYBRID] Block: {commit_kwh:.1f} kWh → "
-                                              f"{tomorrow}  peak {peak_price:.0f} EUR/MWh t={peak_t}")
 
             else:  # DAY_AHEAD — fully independent LP, run now
                 day_df, prev_soc, discharged_kwh = dispatch_day_battery(
@@ -346,8 +231,6 @@ def run_all(df: pd.DataFrame, target_date: str = None) -> pd.DataFrame:
     result_df = pd.concat(results, ignore_index=True)
     result_df._total_discharged_kwh  = total_discharged_kwh
     result_df._failed_days           = failed_days
-    result_df._da_delivery_kwh       = total_da_delivery_kwh
-    result_df._da_block_days         = da_block_days
     return result_df
 
 
@@ -422,10 +305,6 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         total_discharged  = getattr(opt_df, '_total_discharged_kwh', 0.0)
         total_cycles      = total_discharged / CYCLE_KWH
         total_charged_kwh = (opt_df['Batt_Charge_kW'] * TIMESTEP_HOURS).sum()
-        da_delivery_kwh   = getattr(opt_df, '_da_delivery_kwh', 0.0)
-        da_block_days     = getattr(opt_df, '_da_block_days',   0)
-        da_pct            = (da_delivery_kwh / total_discharged * 100
-                             if total_discharged > 0 else 0.0)
         # Financial analysis
         n_days            = opt_df['DateTime'].dt.date.nunique()
         batt_capex        = CAPACITY_KWH * BATTERY_COST_PER_KWH
@@ -463,7 +342,6 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
             ('Total discharged',      f'{total_discharged:,.1f}',      'kWh'),
             ('Total cycles',          f'{total_cycles:.1f}',           'cycles'),
             ('Battery revenue',       f'{total_batt_rev:+,.2f}',       'EUR'),
-            ('DA block days',         f'{da_block_days}  ({da_pct:.1f}% of discharge)',  'days'),
             ('', '', ''),
             ('--- Battery Investment ---', '', ''),
             ('Days simulated',        f'{n_days}',                                     'days'),
@@ -575,8 +453,6 @@ def save_output(opt_df: pd.DataFrame, output_path: str):
         'Payback_Years':       round(simple_payback, 1)    if (batt_rows and simple_payback < 100) else ('>100' if batt_rows else 0),
         'LCOS_EUR_kWh':        round(lcos, 3)              if (batt_rows and lcos < 9999) else 0,
         'Capacity_EOL_pct':    capacity_end_life           if batt_rows else 0,
-        'DA_Block_Days':        da_block_days           if batt_rows else '-',
-        'DA_Delivery_Pct':     round(da_pct, 1)        if batt_rows else '-',
         'Peak_Tariff_EUR':     round(total_peak_cost, 2),
         'Failed_Days':         getattr(opt_df, '_failed_days', 0),
         'Output_File':         os.path.basename(output_path),

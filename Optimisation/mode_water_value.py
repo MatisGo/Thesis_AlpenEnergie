@@ -42,6 +42,7 @@ from hydro_constants import (
 )
 from battery_control import (
     EFF_CHARGE, EFF_DISCHARGE, SOC_MIN, SOC_MAX, _P_MAX_BATT,
+    SOC_TARGET_LO_PCT, SOC_TARGET_HI_PCT, SOC_PENALTY_EUR_KWH,
 )
 
 # ---------------------------------------------------------------------------
@@ -146,14 +147,10 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.dev_pos = Var(m.T, domain=NonNegativeReals)
     m.dev_neg = Var(m.T, domain=NonNegativeReals)
 
-    # Battery variables (INTRADAY / HYBRID battery mode)
-    with_battery = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
+    # Battery variables (INTRADAY battery mode)
+    with_battery = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
     if with_battery:
-        # For HYBRID, soc_max_override caps the SOC ceiling to DA_BLOCK_FLOOR_SOC
-        # so the LP cannot consume the reserved DA energy.
-        soc_max_eff  = (battery_cfg.soc_max_override
-                        if battery_cfg.soc_max_override is not None else SOC_MAX)
-        soc0_clamped = max(SOC_MIN, min(soc_max_eff, battery_cfg.soc0))
+        soc0_clamped = max(SOC_MIN, min(SOC_MAX, battery_cfg.soc0))
         m.batt_c   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
         m.batt_d   = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
         m.batt_SOC = Var(m.T_ext, domain=NonNegativeReals)
@@ -161,7 +158,7 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         m.batt_soc_lo = Constraint([t for t in T_ext if t >= 1],
                                    rule=lambda m, t: m.batt_SOC[t] >= SOC_MIN)
         m.batt_soc_hi = Constraint([t for t in T_ext if t >= 1],
-                                   rule=lambda m, t: m.batt_SOC[t] <= soc_max_eff)
+                                   rule=lambda m, t: m.batt_SOC[t] <= SOC_MAX)
         m.batt_soc_bal = Constraint(m.T, rule=lambda m, t:
             m.batt_SOC[t + 1] == m.batt_SOC[t]
                                + m.batt_c[t] * EFF_CHARGE    * TIMESTEP_HOURS
@@ -212,7 +209,20 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         - PW_SLOPE4 * (m.pw_b4 + m.pw_h4)
     )
     peak_penalty = PEAK_TARIFF_EUR_KW * m.excess_peak
-    m.obj = Objective(expr=-imbalance_cost + penalties - peak_penalty, sense=maximize)
+
+    # End-of-day SOC flexibility reserve penalty
+    soc_penalty = 0
+    if with_battery:
+        usable        = SOC_MAX - SOC_MIN
+        soc_target_lo = SOC_MIN + SOC_TARGET_LO_PCT * usable
+        soc_target_hi = SOC_MIN + SOC_TARGET_HI_PCT * usable
+        m.dev_soc_lo = Var(domain=NonNegativeReals)
+        m.dev_soc_hi = Var(domain=NonNegativeReals)
+        m.soc_dev_lo_con = Constraint(expr=m.dev_soc_lo >= soc_target_lo - m.batt_SOC[N])
+        m.soc_dev_hi_con = Constraint(expr=m.dev_soc_hi >= m.batt_SOC[N] - soc_target_hi)
+        soc_penalty = SOC_PENALTY_EUR_KWH * (m.dev_soc_lo + m.dev_soc_hi)
+
+    m.obj = Objective(expr=-imbalance_cost + penalties - peak_penalty - soc_penalty, sense=maximize)
     return m
 
 
@@ -239,7 +249,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     id_price    = day_df['Intra_Day_Price_EUR_MWh'].tolist()
     inflow_b    = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h    = day_df['Haselholz_Inflow_ls'].tolist()
-    with_batt   = battery_cfg is not None and battery_cfg.mode in ('INTRADAY', 'HYBRID')
+    with_batt   = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
 
     model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
                           lb0, lh0, target_lb, target_lh,

@@ -70,20 +70,14 @@ from hydro_constants import TIMESTEP_HOURS
 class BatteryConfig:
     """Immutable battery configuration passed into every dispatch_day function.
 
-    mode             : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
-                       'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
-                       'HYBRID'    — INTRADAY co-sim with optional DA block reservation.
-    soc0             : SOC at start of the day [kWh], carried from previous day.
-    soc_max_override : When set, replaces SOC_MAX for the INTRADAY controller.
-                       Used by HYBRID mode to cap the INTRADAY zone below the DA
-                       block floor, so committed energy stays reserved.
-                       None → use the global SOC_MAX.
+    mode : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
+           'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
+    soc0 : SOC at start of the day [kWh], carried from previous day.
 
     Pass None instead of a BatteryConfig to signal battery inactive.
     """
     mode: str
     soc0: float
-    soc_max_override: float = None
 
 # ---------------------------------------------------------------------------
 # Battery specifications
@@ -105,6 +99,13 @@ SOC_MAX     = round(SOC_MAX_PCT     * CAPACITY_KWH, 6)   # 5 400.0 kWh
 SOC_INITIAL = round(SOC_INITIAL_PCT * CAPACITY_KWH, 6)   #   600.0 kWh
 
 CYCLE_KWH   = CAPACITY_KWH                               # 1 full cycle = full usable capacity
+
+# ---------------------------------------------------------------------------
+# End-of-day SOC target range  (flexibility reserve)
+# ---------------------------------------------------------------------------
+SOC_TARGET_LO_PCT   = 0.50   # lower bound of target range (fraction of usable SOC range)
+SOC_TARGET_HI_PCT   = 0.60   # upper bound of target range (fraction of usable SOC range)
+SOC_PENALTY_EUR_KWH = 0.005  # EUR per kWh of end-of-day SOC deviation from target range
 
 # ---------------------------------------------------------------------------
 # C-rate — inverter / hardware power limit
@@ -193,9 +194,9 @@ DISCHARGE_THRESHOLD = 0.30   # discharge when fill < 30 %
 # the threshold, up to _P_MAX_BATT and capped by available SOC headroom.
 
 
-def battery_step_forecast(soc, fill_b, fill_h, soc_max_eff=None):
+def battery_step_forecast(soc, fill_b, fill_h):
     """
-    Compute one 5-min timestep of the INTRADAY / HYBRID battery controller.
+    Compute one 5-min timestep of the INTRADAY battery controller.
 
     Called at every timestep from inside the hydro dispatch loop so that
     the battery decision and the water-balance update share the same clock.
@@ -203,8 +204,8 @@ def battery_step_forecast(soc, fill_b, fill_h, soc_max_eff=None):
 
     Power is proportional to the reservoir deviation from its threshold:
 
-      charge_urgency   = max(fill_b, fill_h) - CHARGE_THRESHOLD
-                         normalised to [0, 1] over [threshold → 1.0]
+      charge_urgency    = max(fill_b, fill_h) - CHARGE_THRESHOLD
+                          normalised to [0, 1] over [threshold → 1.0]
       discharge_urgency = DISCHARGE_THRESHOLD - min(fill_b, fill_h)
                           normalised to [0, 1] over [threshold → 0.0]
 
@@ -214,12 +215,9 @@ def battery_step_forecast(soc, fill_b, fill_h, soc_max_eff=None):
 
     Parameters
     ----------
-    soc         : current state of charge [kWh]  (start of timestep)
-    fill_b      : Bidmi fill ratio     [0..1]
-    fill_h      : Haselholz fill ratio [0..1]
-    soc_max_eff : effective SOC upper limit [kWh]; if None, uses global SOC_MAX.
-                  Set by HYBRID mode to DA_BLOCK_FLOOR_SOC so the INTRADAY
-                  controller cannot consume reserved DA energy.
+    soc    : current state of charge [kWh]  (start of timestep)
+    fill_b : Bidmi fill ratio     [0..1]
+    fill_h : Haselholz fill ratio [0..1]
 
     Returns
     -------
@@ -227,7 +225,7 @@ def battery_step_forecast(soc, fill_b, fill_h, soc_max_eff=None):
     discharge_kw : power pushed out of battery         [kW]
     soc_new      : SOC at end of timestep              [kWh]
     """
-    _soc_max = soc_max_eff if soc_max_eff is not None else SOC_MAX
+    _soc_max = SOC_MAX
 
     # --- Charge urgency: worst (highest) reservoir above threshold ---
     fill_excess = max(fill_b - CHARGE_THRESHOLD, fill_h - CHARGE_THRESHOLD, 0.0)
