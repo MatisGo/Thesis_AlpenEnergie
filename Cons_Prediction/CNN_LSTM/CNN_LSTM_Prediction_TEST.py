@@ -130,7 +130,7 @@ LSTM_UNITS = [128, 64]
 
 # Dense output
 DENSE_UNITS = 256
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.2
 
 # Week-level cross-attention (stat profiles)
 ATTN_DIM = 32          # Key/query projection dimension for the attention layer
@@ -1106,8 +1106,8 @@ def run_train():
     # Random validation split — drawn uniformly across all seasons so the
     # validation set is not biased toward the most recent months.
     val_size  = max(1, int(n_train * VAL_RATIO))
-    val_idx   = np.arange(n_train - val_size, n_train)   # last N by time
-    train_idx = np.arange(n_train - val_size)
+    val_idx   = np.random.choice(n_train, size=val_size, replace=False)
+    train_idx = np.setdiff1d(np.arange(n_train), val_idx)
 
     def _split(arr):
         return arr[train_idx], arr[val_idx]

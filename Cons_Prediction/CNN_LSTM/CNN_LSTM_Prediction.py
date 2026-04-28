@@ -121,7 +121,7 @@ LSTM_UNITS = [128, 64]
 
 # Dense output
 DENSE_UNITS = 256
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.2
 
 # Week-level cross-attention (stat profiles)
 ATTN_DIM = 32          # Key/query projection dimension for the attention layer
@@ -139,7 +139,7 @@ HYBRID_N_PAST_WEEKS = 8        # Number of same-day-of-week weeks to look back
 HYBRID_AGG_METHOD = 'mean'     # 'mean' or 'median' for historical aggregation
 
 # Decoder conditioning (same-weekday statistical profiles as second model input)
-STAT_N_WEEKS = 4 if OUTPUT_HOURS >= 96 else 8   # 4 for 96h (less imputation), 8 for 48h
+STAT_N_WEEKS = 8               # Number of past same-weekday profiles fed to decoder
 
 
 # =============================================================================
@@ -931,198 +931,6 @@ def load_config():
     return scaler_X, scaler_y, scaler_stat, scaler_pv
 
 
-
-# =============================================================================
-# OPERATIONAL BACKTEST  (midnight → evaluate hours 24-48 only)
-# =============================================================================
-
-def evaluate_operational_backtest(model, df, scaler_X, scaler_y,
-                                   scaler_stat, scaler_pv,
-                                   ratio_table, test_cutoff):
-    """
-    Operational backtest: one prediction per midnight in the test period.
-
-    At each midnight the model predicts 48 h ahead using real past data.
-    Only hours 24-48 of each forecast are scored (Option A evaluation).
-    This mirrors real deployment: the 48h forecast is made at midnight,
-    and the second day (the harder horizon) is evaluated against reality.
-
-    Produces:
-      - Console KPI table (per-day + aggregate)
-      - Plot: concatenated day-2 actual / CNN-LSTM / external timeseries
-              + aggregate KPI bar chart
-    """
-    KPI_START = 24 * STEPS_PER_HOUR   # step index where evaluation begins
-    KPI_END   = FORECAST_HORIZON       # = 48 * STEPS_PER_HOUR
-
-    n_feat = len(INPUT_FEATURES)
-
-    # Midnights strictly inside the test window that still have 48h of future data
-    first_midnight = (pd.Timestamp(test_cutoff).normalize()
-                      + pd.Timedelta(days=1))
-    last_possible  = df['DateTime'].iloc[-1] - pd.Timedelta(hours=48)
-    midnights = pd.date_range(start=first_midnight,
-                              end=min(last_possible,
-                                      df['DateTime'].iloc[-1]),
-                              freq='D')
-    midnights = [m for m in midnights if m <= last_possible]
-
-    if not midnights:
-        print("  Operational backtest: no valid midnight windows found.")
-        return
-
-    print(f"\n{'='*60}")
-    print(f"OPERATIONAL BACKTEST  ({len(midnights)} midnights, hours 24-48)")
-    print(f"{'='*60}")
-    print(f"{'Date':<12} {'CNN RMSE':>10} {'CNN MAE':>10} "
-          f"{'CNN MAPE':>10} {'Ext RMSE':>10} {'Ext MAE':>10} {'Ext MAPE':>10}")
-    print('-' * 72)
-
-    # Accumulators for concatenated time series
-    all_actual, all_cnn, all_ext, all_ts = [], [], [], []
-    per_day_cnn, per_day_ext = [], []
-
-    load_values = df['Load_Is'].values.astype(np.float32)
-
-    for midnight in midnights:
-        # Find row index for this midnight
-        idx = (df['DateTime'] - midnight).abs().idxmin()
-        if idx < LOOKBACK_STEPS or idx + FORECAST_HORIZON > len(df):
-            continue
-
-        # Encoder input (7 days of real data)
-        X_raw = df[INPUT_FEATURES].values[idx - LOOKBACK_STEPS:idx].astype(np.float32)
-        if np.isnan(X_raw).any():
-            X_raw = (pd.DataFrame(X_raw, columns=INPUT_FEATURES)
-                     .interpolate().bfill().ffill().values.astype(np.float32))
-
-        # Statistical decoder profile
-        stat = build_stat_profiles(load_values, np.array([idx]),
-                                   horizon=FORECAST_HORIZON,
-                                   n_weeks=STAT_N_WEEKS)   # (1, 576, N_WEEKS)
-
-        # PV horizon (decoder input 3)
-        pv_slice = df['PV_Est'].values[idx:idx + FORECAST_HORIZON].astype(np.float32)
-        if len(pv_slice) < FORECAST_HORIZON:
-            pv_slice = np.pad(pv_slice, (0, FORECAST_HORIZON - len(pv_slice)))
-        pv = pv_slice.reshape(1, FORECAST_HORIZON)
-
-        # Scale
-        X_s    = scaler_X.transform(X_raw.reshape(-1, n_feat)).reshape(1, LOOKBACK_STEPS, n_feat)
-        stat_s = scaler_stat.transform(
-            stat.reshape(-1, STAT_N_WEEKS)).reshape(1, FORECAST_HORIZON, STAT_N_WEEKS)
-        pv_s   = scaler_pv.transform(pv.reshape(-1, 1)).reshape(1, FORECAST_HORIZON, 1)
-
-        # Predict and inverse-transform
-        y_s    = model.predict([X_s, stat_s, pv_s], verbose=0)
-        y_pred = scaler_y.inverse_transform(y_s).flatten()
-
-        # Ground truth and external forecast for hours 24-48
-        actual_full = df['Load_Is'].values[idx:idx + FORECAST_HORIZON].astype(np.float32)
-        ext_full    = pd.to_numeric(
-            df['Forecast_Load'].iloc[idx:idx + FORECAST_HORIZON],
-            errors='coerce').values.astype(np.float32)
-
-        actual_d2 = actual_full[KPI_START:KPI_END]
-        cnn_d2    = y_pred[KPI_START:KPI_END]
-        ext_d2    = ext_full[KPI_START:KPI_END]
-
-        # Per-day KPIs
-        m_cnn = compute_metrics(actual_d2, cnn_d2)
-        per_day_cnn.append(m_cnn)
-
-        ext_mask = np.isfinite(ext_d2) & (ext_d2 > 0)
-        m_ext = (compute_metrics(actual_d2[ext_mask], ext_d2[ext_mask])
-                 if ext_mask.any() else {'rmse': np.nan, 'mae': np.nan, 'mape': np.nan})
-        per_day_ext.append(m_ext)
-
-        day_label = midnight.strftime('%Y-%m-%d')
-        print(f"{day_label:<12} "
-              f"{m_cnn['rmse']:>10.1f} {m_cnn['mae']:>10.1f} {m_cnn['mape']:>9.1f}% "
-              f"{m_ext['rmse']:>10.1f} {m_ext['mae']:>10.1f} {m_ext['mape']:>9.1f}%")
-
-        # Timestamps for day-2 window
-        ts_d2 = [midnight + pd.Timedelta(hours=24) + pd.Timedelta(minutes=5 * i)
-                 for i in range(KPI_END - KPI_START)]
-        all_ts     += ts_d2
-        all_actual += actual_d2.tolist()
-        all_cnn    += cnn_d2.tolist()
-        all_ext    += ext_d2.tolist()
-
-    if not per_day_cnn:
-        print("  No valid windows — skipping plot.")
-        return
-
-    # Aggregate KPIs (nanmean across days)
-    def _agg(metric_list, key):
-        return float(np.nanmean([m[key] for m in metric_list]))
-
-    agg_cnn = {k: _agg(per_day_cnn, k) for k in ('rmse', 'mae', 'mape')}
-    agg_ext = {k: _agg(per_day_ext, k) for k in ('rmse', 'mae', 'mape')}
-
-    print('-' * 72)
-    print(f"{'Aggregate':<12} "
-          f"{agg_cnn['rmse']:>10.1f} {agg_cnn['mae']:>10.1f} {agg_cnn['mape']:>9.1f}% "
-          f"{agg_ext['rmse']:>10.1f} {agg_ext['mae']:>10.1f} {agg_ext['mape']:>9.1f}%")
-    print('=' * 60)
-
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6),
-                                    gridspec_kw={'width_ratios': [3, 1]})
-
-    # Left: time series (day-2 windows concatenated)
-    all_ts_arr  = np.array(all_ts)
-    act_arr     = np.array(all_actual, dtype=np.float32)
-    cnn_arr     = np.array(all_cnn,    dtype=np.float32)
-    ext_arr     = np.array(all_ext,    dtype=np.float32)
-    ext_valid   = np.isfinite(ext_arr) & (ext_arr > 0)
-
-    ax1.plot(all_ts_arr, act_arr, 'b-',  label='Actual',            lw=1.2)
-    ax1.plot(all_ts_arr, cnn_arr, 'r--', label='CNN-LSTM (h24-48)', lw=1.2)
-    if ext_valid.any():
-        ax1.plot(all_ts_arr[ext_valid], ext_arr[ext_valid],
-                 'g-.', label='External (h24-48)', lw=1.2)
-
-    ax1.set_title(f'Operational Backtest — Day+2 forecast ({len(midnights)} midnights)',
-                  fontsize=13, fontweight='bold')
-    ax1.set_xlabel('Date')
-    ax1.set_ylabel('Load (kW)')
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    ax1.tick_params(axis='x', rotation=30)
-
-    # Right: KPI bar chart
-    metric_names = ['RMSE (kW)', 'MAE (kW)', 'MAPE (%)']
-    cnn_vals = [agg_cnn['rmse'], agg_cnn['mae'], agg_cnn['mape']]
-    ext_vals = [agg_ext['rmse'], agg_ext['mae'], agg_ext['mape']]
-    x_pos = np.arange(len(metric_names))
-    w = 0.35
-
-    bars_c = ax2.bar(x_pos - w/2, cnn_vals, w,
-                     label='CNN-LSTM', color='steelblue', edgecolor='black', alpha=0.8)
-    bars_e = ax2.bar(x_pos + w/2, ext_vals, w,
-                     label='External', color='coral',    edgecolor='black', alpha=0.8)
-
-    for bar in bars_c:
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                 f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=9)
-    for bar in bars_e:
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                 f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=9)
-
-    ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(metric_names, fontsize=11)
-    ax2.set_title('Operational KPIs\n(avg over day+2 windows)', fontsize=12, fontweight='bold')
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    out_path = os.path.join(RESULTS_DIR, 'Operational_Backtest.png')
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    print(f"  Saved: {out_path}")
-
-
 # =============================================================================
 # TRAIN MODE
 # =============================================================================
@@ -1246,8 +1054,8 @@ def run_train():
     # Random validation split — drawn uniformly across all seasons so the
     # validation set is not biased toward the most recent months.
     val_size  = max(1, int(n_train * VAL_RATIO))
-    val_idx   = np.arange(n_train - val_size, n_train)   # last N by time
-    train_idx = np.arange(n_train - val_size)
+    val_idx   = np.random.choice(n_train, size=val_size, replace=False)
+    train_idx = np.setdiff1d(np.arange(n_train), val_idx)
 
     def _split(arr):
         return arr[train_idx], arr[val_idx]
@@ -1285,12 +1093,6 @@ def run_train():
 
     # 8. Visualize and compare
     plot_evaluation(y_test, y_pred, fc_test, ts_test, history)
-
-    # 8b. Operational backtest: one midnight per day, evaluate hours 24-48
-    print("\n--- Step 8b: Operational Backtest (hours 24-48) ---")
-    evaluate_operational_backtest(
-        model, df, scaler_X, scaler_y, scaler_stat, scaler_pv,
-        ratio_table, test_cutoff)
 
     # 9. Save config (including all scalers)
     print("\n--- Step 8: Saving Model & Config ---")
