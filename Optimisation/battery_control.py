@@ -105,7 +105,7 @@ CYCLE_KWH   = CAPACITY_KWH                               # 1 full cycle = full u
 # ---------------------------------------------------------------------------
 SOC_TARGET_LO_PCT   = 0.50   # lower bound of target range (fraction of usable SOC range)
 SOC_TARGET_HI_PCT   = 0.60   # upper bound of target range (fraction of usable SOC range)
-SOC_PENALTY_EUR_KWH = 0.005  # EUR per kWh of end-of-day SOC deviation from target range
+SOC_PENALTY_EUR_KWH = 0.002  # EUR per kWh of end-of-day SOC deviation from target range
 
 # ---------------------------------------------------------------------------
 # C-rate — inverter / hardware power limit
@@ -113,7 +113,7 @@ SOC_PENALTY_EUR_KWH = 0.005  # EUR per kWh of end-of-day SOC deviation from targ
 # 0.5 C means the battery can charge or discharge at 50 % of its nominal
 # capacity per hour.  For a 200 kWh battery: P_max = 0.5 × 200 = 100 kW.
 # This value caps both the rule-based controller and the LP variable bounds.
-C_RATE      = 1                               # C  (change here to adjust power limit)
+C_RATE      = 0.5                               # C  (change here to adjust power limit)
 _P_MAX_BATT = round(C_RATE * CAPACITY_KWH, 3)  # kW — used as LP upper bound
 
 

@@ -72,11 +72,13 @@ class DailyAnalysisApp:
     # ------------------------------------------------------------------
 
     def _available_files(self):
-        """Return list of .xlsx filenames found in the Output directory."""
+        """Return list of results .xlsx filenames (excludes summary files without a Results sheet)."""
         if not os.path.isdir(OUTPUT_DIR):
             return []
+        EXCLUDE = {'Main_results.xlsx'}
         return sorted(
-            f for f in os.listdir(OUTPUT_DIR) if f.endswith('.xlsx'))
+            f for f in os.listdir(OUTPUT_DIR)
+            if f.endswith('.xlsx') and f not in EXCLUDE)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -262,17 +264,27 @@ class DailyAnalysisApp:
             c for c in df.columns
             if c != 'DateTime' and pd.api.types.is_numeric_dtype(df[c])
         ]
-        defaults = [
-            'Forecast_kW',
-            'Opt_Production_kW',
-            'Opt_Bidmi_mm',
-            'Opt_Haselholz_mm',
+        # Panel 0: hydro production view
+        # Panel 1: battery / financial / grid-import view
+        PANEL_DEFAULTS = [
+            [   # Panel 0 — hydro
+                'Opt_Production_kW',
+                'Forecast_kW',
+                'Opt_Bidmi_mm',
+                'Opt_Haselholz_mm',
+            ],
+            [   # Panel 1 — battery & financials
+                'Batt_SOC_kWh',
+                'Batt_Net_kW',
+                'P_Import_15min_kW',
+                'Opt_Energy_Trading_EUR',
+            ],
         ]
+        defaults = PANEL_DEFAULTS[idx] if idx < len(PANEL_DEFAULTS) else PANEL_DEFAULTS[0]
         for j, combo in enumerate(p['sel_combos']):
             current = combo.get()
             combo['values'] = cols
             if current not in cols:
-                # Apply default if available, otherwise clear
                 default = defaults[j] if j < len(defaults) else '— none —'
                 combo.set(default if default in cols else '— none —')
 
