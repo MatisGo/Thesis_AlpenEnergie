@@ -130,7 +130,7 @@ def main():
     # Step 3 — Load forecast
     log.info(f"Step 3/4 — CNN-LSTM {forecast_hours}h forecast ...")
     try:
-        import CNN_LSTM_Prediction
+        import CNN_LSTM_Prediction_TEST as CNN_LSTM_Prediction
         CNN_LSTM_Prediction.run_forecast(predict_date, hours=forecast_hours)
         output_path = _verify_output(predict_date)
         log.info(f"  Output: {output_path}")
