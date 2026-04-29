@@ -25,19 +25,22 @@ import traceback
 # =============================================================================
 
 PREDICT_DATE_OFFSET    = 0     # 0 = today at 00:00,  1 = tomorrow, etc.
-RUN_ON_WEEKEND         = True  # If False, skip Saturday and Sunday
+RUN_ON_WEEKEND         = False #if False, skip Saturday and Sunday
 DEFAULT_FORECAST_HOURS = 48    # Mon–Thu
 FRIDAY_FORECAST_HOURS  = 96   # Friday (covers full weekend)
 
 # --- Paths -------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "Output Forecast")
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR    = os.path.join(SCRIPT_DIR, "..", "Output Forecast")
+PAST_PRED_DIR = os.path.join(OUTPUT_DIR, "Past_Prediction")
+PAST_PRED_FILE = os.path.join(PAST_PRED_DIR, "Load_Forecast_History.xlsx")
 
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 LOG_FILE   = os.path.join(SCRIPT_DIR, "main_runner.log")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(PAST_PRED_DIR, exist_ok=True)
 
 # =============================================================================
 # LOGGING
@@ -58,6 +61,24 @@ log = logging.getLogger(__name__)
 # =============================================================================
 # PIPELINE
 # =============================================================================
+
+def _archive_prediction(csv_path: str, predict_date: str) -> None:
+    """Append today's load forecast to the cumulative history Excel file."""
+    import pandas as pd
+
+    df_new = pd.read_csv(csv_path)
+    df_new.insert(0, 'Prediction_Date', predict_date)
+
+    if os.path.isfile(PAST_PRED_FILE):
+        df_hist = pd.read_excel(PAST_PRED_FILE, engine='openpyxl')
+        df_hist = df_hist[df_hist['Prediction_Date'] != predict_date]
+        df_combined = pd.concat([df_hist, df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+
+    df_combined.to_excel(PAST_PRED_FILE, index=False, engine='openpyxl')
+    log.info(f"  Past Prediction archive: {len(df_combined)} rows  ->  {PAST_PRED_FILE}")
+
 
 def _verify_output(predict_date: str) -> str:
     export_date  = (datetime.date.fromisoformat(predict_date) + datetime.timedelta(days=1)).isoformat()
@@ -117,6 +138,12 @@ def main():
     except Exception:
         log.error(f"Step 3 failed:\n{traceback.format_exc()}")
         sys.exit(1)
+
+    # Archive load forecast to Past_Prediction history
+    try:
+        _archive_prediction(output_path, predict_date)
+    except Exception:
+          log.warning("Archive step failed (non-critical): " + traceback.format_exc())
 
     # Step 4 — Production forecast (DNN) → write to new sheet in output Excel
     log.info("Step 4/4 — DNN production forecast ...")
