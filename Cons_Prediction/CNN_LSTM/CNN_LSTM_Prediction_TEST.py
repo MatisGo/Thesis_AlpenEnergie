@@ -130,7 +130,9 @@ LSTM_UNITS = [128, 64]
 
 # Dense output
 DENSE_UNITS = 256
-DROPOUT_RATE = 0.2
+DROPOUT_RATE = 0.3
+
+
 
 # Week-level cross-attention (stat profiles)
 ATTN_DIM = 32          # Key/query projection dimension for the attention layer

@@ -1,18 +1,19 @@
 """
 daily_analysis.py
 =================
-Interactive daily dashboard for hydro optimisation results.
+Interactive weekly dashboard for hydro optimisation results.
 
 Layout
 ------
-  [File selector + Controls 1] | [Graph 1] || [File selector + Controls 2] | [Graph 2]
-  ──────────────────────────────────────────────────────────────────────────────────────
-  [Date selector — bottom, shara ed across both graphs]
+  [File selector + Controls (6 curves)] | [Graph]
+  ──────────────────────────────────────────────
+  [Week selector — bottom]
 
-Each panel loads its own results file independently.
-Each graph has 4 curve slots with colour-coded Y-axes.
+Single panel. The graph has 6 curve slots with colour-coded Y-axes.
 Reservoir-level columns automatically show Min/Max bounds in red.
 Y-axis range can be overridden per curve with the Min/Max inputs.
+
+Each selected week starts on Monday and spans 7 days (Mon → Sun).
 
 Usage
 -----
@@ -43,36 +44,76 @@ LEVEL_BOUNDS = {
     'Opt_Haselholz_mm': ( 600, 2800),
 }
 
-CURVE_COLORS = ['#2166ac', '#d6604d', '#4dac26', '#8073ac']
+CURVE_COLORS = ['#2166ac', '#d6604d', '#4dac26', '#8073ac', '#e08214', '#01665e']
 BOUND_COLOR  = '#b2182b'
-N_CURVES     = 4
+N_CURVES     = 6
 
-# Right-axis offsets (outward px) for curves 2, 3, 4
-AXIS_OFFSETS = [0, 60, 120]
+# Outward px offsets for the 5 right-side twin axes (curves 2..6)
+AXIS_OFFSETS = [0, 60, 120, 180, 240]
+
+# Group prefixes shown in the curve dropdowns. The mapping decides where each
+# raw column name lands; unknown columns fall under 'Other'.
+COLUMN_GROUPS = [
+    ('Hydro',    ['Opt_Production_kW', 'Opt_M1_kW', 'Opt_M2_kW',
+                  'Forecast_kW', 'Forecast_Drift_kW',
+                  'Ref_M1_kW', 'Ref_M2_kW',
+                  'Opt_Spill_Bidmi_kWh', 'Opt_Spill_Haselholz_kWh',
+                  'Opt_Spill_Bidmi_kWh_Cum', 'Opt_Spill_Haselholz_kWh_Cum']),
+    ('Reservoir',['Opt_Bidmi_mm', 'Opt_Haselholz_mm',
+                  'Bidmi_mm', 'Haselholz_mm',
+                  'Opt_Target_Bidmi_mm', 'Opt_Target_Haselholz_mm',
+                  'Bidmi_Inflow_ls', 'Haselholz_Inflow_ls']),
+    ('Load',     ['Consumption_kW', 'Forecast_Consumption_kW']),
+    ('Grid',     ['DA_Import_kW', 'DA_Export_kW',
+                  'Imbalance_Import_kW',
+                  'P_Import_kW', 'P_Import_15min_kW', 'P_Exchange_kW']),
+    ('Battery',  ['Batt_SOC_kWh', 'Batt_Charge_kW', 'Batt_Discharge_kW',
+                  'Batt_Net_kW', 'Batt_Revenue_EUR']),
+    ('Money',    ['Opt_DA_Trading_EUR', 'Opt_ID_Imbalance_EUR',
+                  'Opt_Energy_Trading_EUR', 'Opt_Total_Energy_Cost_EUR',
+                  'Day_Ahead_Price_EUR_MWh',
+                  'BG_Long_EUR_MWh', 'BG_Short_EUR_MWh']),
+    ('Mode',     ['Opt_Dispatch_Mode', 'Opt_Recovery_Bidmi',
+                  'Opt_Recovery_Haselholz', 'Opt_Forecast_Scale']),
+]
+
+
+def _grouped_label(col: str) -> str:
+    """Prefix each column name with its group ('Battery: Batt_SOC_kWh')."""
+    for grp, cols in COLUMN_GROUPS:
+        if col in cols:
+            return f'{grp}: {col}'
+    return f'Other: {col}'
+
+
+def _label_to_col(label: str) -> str:
+    """Strip the group prefix to recover the raw column name."""
+    return label.split(': ', 1)[1] if ': ' in label else label
 
 
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
-class DailyAnalysisApp:
+class WeeklyAnalysisApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Daily Analysis — AlpenEnergie")
-        self.root.geometry("1560x820")
+        self.root.title("Weekly Analysis — AlpenEnergie")
+        self.root.geometry("1280x780")
         self.root.minsize(960, 540)
-        self.panels = []
+        self.panel = None
+        self._week_lookup = {}    # label → Monday timestamp
 
         self._build_ui()
-        self._auto_load_panels()
+        self._auto_load_panel()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _available_files(self):
-        """Return list of results .xlsx filenames (excludes summary files without a Results sheet)."""
+        """Return list of results .xlsx filenames (excludes summary files)."""
         if not os.path.isdir(OUTPUT_DIR):
             return []
         EXCLUDE = {'Main_results.xlsx'}
@@ -85,21 +126,21 @@ class DailyAnalysisApp:
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # ── Bottom bar (shared date selector) ─────────────────────────
+        # ── Bottom bar (week selector) ────────────────────────────────
         bar = tk.Frame(self.root, relief='ridge', bd=2, pady=6, bg='#e8e8e8')
         bar.pack(side='bottom', fill='x')
 
-        tk.Label(bar, text="Date:", font=('Arial', 11, 'bold'),
+        tk.Label(bar, text="Week starting:", font=('Arial', 11, 'bold'),
                  bg='#e8e8e8').pack(side='left', padx=(15, 5))
 
-        self.date_var   = tk.StringVar()
-        self.date_combo = ttk.Combobox(
-            bar, textvariable=self.date_var,
-            width=13, state='readonly', font=('Arial', 10))
-        self.date_combo.pack(side='left')
-        self.date_combo.bind('<<ComboboxSelected>>', lambda _: self._refresh_all())
+        self.week_var   = tk.StringVar()
+        self.week_combo = ttk.Combobox(
+            bar, textvariable=self.week_var,
+            width=42, state='readonly', font=('Arial', 10))
+        self.week_combo.pack(side='left')
+        self.week_combo.bind('<<ComboboxSelected>>', lambda _: self._redraw())
 
-        tk.Label(bar, text="  ← select a date to update both graphs",
+        tk.Label(bar, text="  ← select a week (Mon → Sun)",
                  font=('Arial', 9, 'italic'), fg='#666666',
                  bg='#e8e8e8').pack(side='left')
 
@@ -107,22 +148,20 @@ class DailyAnalysisApp:
         top = tk.Frame(self.root)
         top.pack(side='top', fill='both', expand=True)
 
-        for i in range(2):
-            p = self._make_panel(top, i)
-            p['outer'].pack(side='left', fill='both', expand=True,
-                            padx=3, pady=3)
-            self.panels.append(p)
+        self.panel = self._make_panel(top)
+        self.panel['outer'].pack(side='left', fill='both', expand=True,
+                                 padx=3, pady=3)
 
-    def _make_panel(self, parent, idx):
-        """Build one (controls + figure) panel. Returns state dict."""
+    def _make_panel(self, parent):
+        """Build the single (controls + figure) panel."""
         outer = tk.Frame(parent, bd=2, relief='groove')
 
         # ── Left control strip ────────────────────────────────────────
-        ctrl = tk.Frame(outer, width=225, bg='#f0f0f0')
+        ctrl = tk.Frame(outer, width=235, bg='#f0f0f0')
         ctrl.pack(side='left', fill='y', padx=2, pady=2)
         ctrl.pack_propagate(False)
 
-        tk.Label(ctrl, text=f"  Graph {idx + 1}",
+        tk.Label(ctrl, text="  Graph",
                  font=('Arial', 10, 'bold'), bg='#f0f0f0',
                  anchor='w').pack(fill='x', pady=(10, 2))
 
@@ -137,13 +176,12 @@ class DailyAnalysisApp:
         file_combo.pack(fill='x', padx=6, pady=(1, 0))
 
         tk.Button(ctrl, text="Load file",
-                  command=lambda i=idx: self._load_panel(i),
+                  command=self._load_panel,
                   width=14, font=('Arial', 8)).pack(pady=(3, 0))
 
-        # Label showing currently loaded file
         loaded_label = tk.Label(ctrl, text="(no file loaded)",
                                 font=('Arial', 7, 'italic'), fg='#888888',
-                                bg='#f0f0f0', anchor='w', wraplength=200)
+                                bg='#f0f0f0', anchor='w', wraplength=210)
         loaded_label.pack(fill='x', padx=6, pady=(1, 4))
 
         ttk.Separator(ctrl, orient='horizontal').pack(fill='x', padx=6, pady=4)
@@ -167,8 +205,7 @@ class DailyAnalysisApp:
             combo = ttk.Combobox(top_row, textvariable=var,
                                  width=16, state='readonly')
             combo.pack(side='left', padx=3, fill='x', expand=True)
-            combo.bind('<<ComboboxSelected>>',
-                       lambda _, i=idx: self._redraw(i))
+            combo.bind('<<ComboboxSelected>>', lambda _: self._redraw())
 
             sel_vars.append(var)
             sel_combos.append(combo)
@@ -185,14 +222,14 @@ class DailyAnalysisApp:
             e_min = tk.Entry(minmax_row, textvariable=ymin_v, width=6,
                              font=('Arial', 7))
             e_min.pack(side='left', padx=1)
-            e_min.bind('<Return>', lambda _, i=idx: self._redraw(i))
+            e_min.bind('<Return>', lambda _: self._redraw())
 
             tk.Label(minmax_row, text='Max', fg=color, bg='#f0f0f0',
                      font=('Arial', 7), width=3).pack(side='left', padx=(4, 0))
             e_max = tk.Entry(minmax_row, textvariable=ymax_v, width=6,
                              font=('Arial', 7))
             e_max.pack(side='left', padx=1)
-            e_max.bind('<Return>', lambda _, i=idx: self._redraw(i))
+            e_max.bind('<Return>', lambda _: self._redraw())
 
             ymin_vars.append(ymin_v)
             ymax_vars.append(ymax_v)
@@ -200,11 +237,11 @@ class DailyAnalysisApp:
         # Apply button
         ttk.Separator(ctrl, orient='horizontal').pack(fill='x', padx=6, pady=8)
         tk.Button(ctrl, text="Apply Y-axes",
-                  command=lambda i=idx: self._redraw(i),
+                  command=self._redraw,
                   width=14).pack(pady=4)
 
         # ── Matplotlib figure ─────────────────────────────────────────
-        fig = plt.figure(figsize=(6, 5))
+        fig = plt.figure(figsize=(9, 5))
         canvas = FigureCanvasTkAgg(fig, master=outer)
         canvas.get_tk_widget().pack(side='left', fill='both', expand=True)
 
@@ -226,20 +263,17 @@ class DailyAnalysisApp:
     # Data loading
     # ------------------------------------------------------------------
 
-    def _auto_load_panels(self):
-        """On startup, pre-load the first available file into both panels."""
+    def _auto_load_panel(self):
+        """On startup, pre-load the first available file."""
         files = self._available_files()
         if not files:
             return
-        for i, p in enumerate(self.panels):
-            # Load first file into panel 0, second (if exists) into panel 1
-            fname = files[min(i, len(files) - 1)]
-            p['file_var'].set(fname)
-            self._load_panel(i)
+        self.panel['file_var'].set(files[0])
+        self._load_panel()
 
-    def _load_panel(self, idx):
-        """Load the selected file into panel idx and refresh."""
-        p     = self.panels[idx]
+    def _load_panel(self):
+        """Load the selected file and refresh the graph."""
+        p     = self.panel
         fname = p['file_var'].get()
         if not fname:
             return
@@ -259,86 +293,98 @@ class DailyAnalysisApp:
         p['df'] = df
         p['loaded_label'].config(text=fname)
 
-        # Update column selectors for this panel
-        cols = ['— none —'] + [
-            c for c in df.columns
-            if c != 'DateTime' and pd.api.types.is_numeric_dtype(df[c])
+        # Build dropdown values: group-prefixed labels, ordered by COLUMN_GROUPS.
+        numeric_cols = [c for c in df.columns
+                        if c != 'DateTime' and pd.api.types.is_numeric_dtype(df[c])]
+        ordered = []
+        for grp, cols in COLUMN_GROUPS:
+            for c in cols:
+                if c in numeric_cols:
+                    ordered.append(f'{grp}: {c}')
+        # Anything not in a group lands in "Other"
+        grouped_cols = {c for _, cols in COLUMN_GROUPS for c in cols}
+        for c in numeric_cols:
+            if c not in grouped_cols:
+                ordered.append(f'Other: {c}')
+        labels = ['— none —'] + ordered
+
+        DEFAULTS = [
+            'Opt_Production_kW',
+            'Forecast_kW',
+            'DA_Import_kW',
+            'Batt_SOC_kWh',
+            'Batt_Charge_kW',
+            'Batt_Discharge_kW',
         ]
-        # Panel 0: hydro production view
-        # Panel 1: battery / financial / grid-import view
-        PANEL_DEFAULTS = [
-            [   # Panel 0 — hydro
-                'Opt_Production_kW',
-                'Forecast_kW',
-                'Opt_Bidmi_mm',
-                'Opt_Haselholz_mm',
-            ],
-            [   # Panel 1 — battery & financials
-                'Batt_SOC_kWh',
-                'Batt_Net_kW',
-                'P_Import_15min_kW',
-                'Opt_Energy_Trading_EUR',
-            ],
-        ]
-        defaults = PANEL_DEFAULTS[idx] if idx < len(PANEL_DEFAULTS) else PANEL_DEFAULTS[0]
         for j, combo in enumerate(p['sel_combos']):
-            current = combo.get()
-            combo['values'] = cols
-            if current not in cols:
-                default = defaults[j] if j < len(defaults) else '— none —'
-                combo.set(default if default in cols else '— none —')
+            combo['values'] = labels
+            current_col = _label_to_col(combo.get())
+            if current_col in numeric_cols:
+                combo.set(_grouped_label(current_col))
+            else:
+                default = DEFAULTS[j] if j < len(DEFAULTS) else None
+                if default and default in numeric_cols:
+                    combo.set(_grouped_label(default))
+                else:
+                    combo.set('— none —')
 
-        self._update_dates()
-        self._redraw(idx)
+        self._update_weeks()
+        self._redraw()
 
-    def _update_dates(self):
-        """Recompute shared date list as union across all loaded panels."""
-        all_dates = set()
-        for p in self.panels:
-            if p['df'] is not None:
-                all_dates.update(
-                    p['df']['DateTime'].dt.date.unique().astype(str))
-        dates = sorted(all_dates)
-        self.date_combo['values'] = dates
-        if dates and self.date_var.get() not in dates:
-            self.date_var.set(dates[0])
-            self._refresh_all()
+    def _update_weeks(self):
+        """Build the week dropdown from the loaded dataset (Monday-anchored)."""
+        p = self.panel
+        if p['df'] is None:
+            return
+
+        dt = p['df']['DateTime']
+        # Anchor each timestamp to the Monday of its ISO week
+        mondays = (dt - pd.to_timedelta(dt.dt.weekday, unit='D')).dt.normalize()
+        unique_mondays = sorted(pd.Timestamp(d) for d in mondays.unique())
+
+        labels = [
+            f"{m.strftime('%Y-%m-%d')}  →  {(m + pd.Timedelta(days=6)).strftime('%Y-%m-%d')}"
+            for m in unique_mondays
+        ]
+        self._week_lookup = dict(zip(labels, unique_mondays))
+        self.week_combo['values'] = labels
+        if labels and self.week_var.get() not in labels:
+            self.week_var.set(labels[0])
 
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
 
-    def _refresh_all(self):
-        self._redraw(0)
-        self._redraw(1)
-
-    def _day_df(self, idx):
-        p        = self.panels[idx]
-        date_str = self.date_var.get()
-        if not date_str or p['df'] is None:
+    def _week_df(self):
+        p = self.panel
+        if p['df'] is None or self.week_var.get() not in self._week_lookup:
             return None
-        mask = p['df']['DateTime'].dt.date.astype(str) == date_str
-        d    = p['df'][mask].copy()
+        start = self._week_lookup[self.week_var.get()]
+        end   = start + pd.Timedelta(days=7)
+        mask  = (p['df']['DateTime'] >= start) & (p['df']['DateTime'] < end)
+        d     = p['df'].loc[mask].copy()
         return d if not d.empty else None
 
-    def _redraw(self, idx):
-        p   = self.panels[idx]
+    def _redraw(self):
+        p   = self.panel
         fig = p['fig']
         fig.clear()
 
-        day = self._day_df(idx)
-        if day is None:
+        week = self._week_df()
+        if week is None:
             p['canvas'].draw()
             return
 
-        t = day['DateTime']
+        t = week['DateTime']
 
-        # Collect active curve slots
-        active = [
-            (ci, var.get())
-            for ci, var in enumerate(p['sel_vars'])
-            if var.get() != '— none —' and var.get() in day.columns
-        ]
+        active = []
+        for ci, var in enumerate(p['sel_vars']):
+            label = var.get()
+            if label == '— none —':
+                continue
+            col = _label_to_col(label)
+            if col in week.columns:
+                active.append((ci, col))
 
         if not active:
             p['canvas'].draw()
@@ -346,10 +392,10 @@ class DailyAnalysisApp:
 
         n = len(active)
 
-        # ── Adjust figure margins ─────────────────────────────────────
-        right_margin = max(0.60, 0.93 - 0.08 * max(0, n - 1))
-        fig.subplots_adjust(left=0.13, right=right_margin,
-                            top=0.92, bottom=0.28)
+        # ── Adjust figure margins (more right space when many axes) ───
+        right_margin = max(0.55, 0.94 - 0.07 * max(0, n - 1))
+        fig.subplots_adjust(left=0.08, right=right_margin,
+                            top=0.92, bottom=0.22)
 
         # ── Create axes ───────────────────────────────────────────────
         ax_main = fig.add_subplot(111)
@@ -357,8 +403,11 @@ class DailyAnalysisApp:
 
         for k in range(1, n):
             ax_twin = ax_main.twinx()
-            ax_twin.spines['right'].set_position(
-                ('outward', AXIS_OFFSETS[k - 1]))
+            offset_idx = k - 1
+            offset_px = (AXIS_OFFSETS[offset_idx]
+                         if offset_idx < len(AXIS_OFFSETS)
+                         else AXIS_OFFSETS[-1] + 60 * (offset_idx - len(AXIS_OFFSETS) + 1))
+            ax_twin.spines['right'].set_position(('outward', offset_px))
             axes.append(ax_twin)
 
         if n > 1:
@@ -373,8 +422,8 @@ class DailyAnalysisApp:
             ax    = axes[plot_idx]
             color = CURVE_COLORS[ci]
 
-            line, = ax.plot(t, day[col], color=color,
-                            linewidth=1.7, label=col)
+            line, = ax.plot(t, week[col], color=color,
+                            linewidth=1.1, label=col)
 
             ax.set_ylabel(col, color=color, fontsize=7, labelpad=3)
             ax.tick_params(axis='y', colors=color, labelsize=7)
@@ -408,20 +457,21 @@ class DailyAnalysisApp:
             legend_handles.append(line)
             legend_labels.append(col)
 
-        # ── X-axis, grid, title ───────────────────────────────────────
-        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax_main.xaxis.set_major_locator(mdates.HourLocator(interval=3))
-        ax_main.grid(True, alpha=0.22, linestyle=':')
-        fig.autofmt_xdate(rotation=30)
+        # ── X-axis: day boundaries with weekday labels, hour minor ticks ─
+        ax_main.xaxis.set_major_locator(mdates.DayLocator())
+        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%a\n%d/%m'))
+        ax_main.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+        ax_main.grid(True, which='major', alpha=0.35, linestyle='-')
+        ax_main.grid(True, which='minor', alpha=0.15, linestyle=':')
 
-        title = f"{self.date_var.get()}  —  {p['file_var'].get()}"
+        title = f"{self.week_var.get()}   —   {p['file_var'].get()}"
         ax_main.set_title(title, fontsize=8, pad=4)
 
         if legend_handles:
             ax_main.legend(legend_handles, legend_labels,
                            loc='upper center',
-                           bbox_to_anchor=(0.5, -0.22),
-                           ncol=min(len(legend_handles), 3),
+                           bbox_to_anchor=(0.5, -0.18),
+                           ncol=min(len(legend_handles), 4),
                            fontsize=7,
                            framealpha=0.88, edgecolor='#aaaaaa')
 
@@ -434,8 +484,19 @@ class DailyAnalysisApp:
 
 def main():
     root = tk.Tk()
-    DailyAnalysisApp(root)
-    root.mainloop()
+    WeeklyAnalysisApp(root)
+
+    def _on_close():
+        plt.close('all')
+        root.quit()
+        root.destroy()
+
+    # Window-X button → fully shut down (Tk + matplotlib + process)
+    root.protocol('WM_DELETE_WINDOW', _on_close)
+    try:
+        root.mainloop()
+    finally:
+        plt.close('all')
 
 
 if __name__ == '__main__':

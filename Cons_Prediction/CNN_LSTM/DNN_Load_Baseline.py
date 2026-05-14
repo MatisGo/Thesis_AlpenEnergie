@@ -29,6 +29,7 @@ Hyperparameters to tune (top of file):
 Usage
 -----
   python DNN_Load_Baseline.py --train
+  python DNN_Load_Baseline.py --predict 2026-03-01
 """
 
 import argparse
@@ -342,6 +343,138 @@ def _plot_results(history, y_pred, y_true, timestamps, rmse, mae, mape):
 
 
 # ===========================================================================
+# PREDICTION
+# ===========================================================================
+
+def _plot_forecast(t_fc, y_pred, y_actual, predict_date, rmse, mae, mape):
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(t_fc, y_pred, color='#d62728', lw=1.5, ls='--', label='DNN Prediction')
+    if y_actual is not None:
+        ax.plot(t_fc, y_actual, color='#1f77b4', lw=1.5, label='Actual Load')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%a %d\n%H:%M'))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+    kpi_str = f'   RMSE={rmse:.0f} kW  |  MAE={mae:.0f} kW  |  MAPE={mape:.1f}%' if rmse is not None else ''
+    ax.set_title(f'DNN Baseline — 48h Load Forecast from {predict_date}{kpi_str}',
+                 fontsize=11, fontweight='bold')
+    ax.set_ylabel('Load (kW)')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    save_path = os.path.join(RESULTS_DIR, f'DNN_Forecast_{predict_date}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f'  Plot saved to: {save_path}')
+    plt.show()
+
+
+def run_predict(predict_date: str):
+    from tensorflow.keras.models import load_model as keras_load_model
+
+    print('=' * 70)
+    print(f'  SIMPLE DNN LOAD BASELINE — PREDICTION')
+    print(f'  Forecast start : {predict_date} 00:00  |  Horizon : 48h (576 steps)')
+    print('=' * 70)
+
+    # 1. Check saved files
+    for p in [MODEL_PATH, CONFIG_PATH]:
+        if not os.path.isfile(p):
+            raise FileNotFoundError(
+                f'Required file not found: {p}\n  Run --train first.')
+
+    # 2. Load model + scalers
+    model = keras_load_model(MODEL_PATH)
+    cfg     = np.load(CONFIG_PATH)
+    X_min   = cfg['scaler_X_min']
+    X_scale = cfg['scaler_X_scale']
+    y_min   = float(cfg['scaler_y_min'])
+    y_scale = float(cfg['scaler_y_scale'])
+
+    # 3. Load data
+    print('\n--- Loading data ---')
+    pv_nn = load_pv_nn_model()
+    df    = load_data(pv_nn=pv_nn)
+
+    # 4. Locate predict_date in df
+    target_ts = pd.Timestamp(predict_date)
+    after     = pd.to_datetime(df['DateTime']) >= target_ts
+    if not after.any():
+        raise ValueError(f'{predict_date} is beyond the data range.')
+    fc_s = int(np.argmax(after))
+
+    fc_e      = fc_s + FORECAST_HORIZON
+    start_idx = fc_s - LOOKBACK_STEPS
+
+    if start_idx < 0:
+        raise ValueError(
+            f'Not enough history before {predict_date} '
+            f'(need {LOOKBACK_STEPS} steps = 7 days).')
+    if fc_e > len(df):
+        raise ValueError(
+            f'Forecast window extends beyond available data. '
+            f'Extend Data_Prediction.xlsx calendar rows first.')
+
+    print(f'  Forecast window: rows {fc_s} → {fc_e}  '
+          f'({df.index[fc_s]} → {df.index[fc_e - 1]})')
+
+    # 5. Build features for this single sample
+    print('\n--- Building features ---')
+    load_vals = df['Load_Is'].values.astype(np.float32)
+    stat_prof = build_stat_profiles(
+        load_vals, [start_idx],
+        horizon=FORECAST_HORIZON, n_weeks=STAT_N_WEEKS)   # (1, 576, 8)
+
+    pv_horiz = df['PV_Est'].values[fc_s:fc_e].astype(np.float32)
+    weather  = df[WEATHER_COLS].ffill().fillna(0).values.astype(np.float32)
+    time_    = df[TIME_COLS].values.astype(np.float32)
+    holiday  = df['PHolyday'].fillna(0).values.astype(np.float32)
+
+    s0 = STAT_N_WEEKS
+    X  = np.zeros((1, FORECAST_HORIZON, N_FEATURES), dtype=np.float32)
+    X[0, :, :s0]        = stat_prof[0]
+    X[0, :, s0]         = pv_horiz
+    X[0, :, s0+1:s0+5]  = weather[fc_s:fc_e]
+    X[0, :, s0+5:s0+9]  = time_[fc_s:fc_e]
+    X[0, :, s0+9]       = holiday[fc_s:fc_e]
+
+    # 6. Scale → predict → inverse scale
+    X_sc   = ((X.reshape(-1, N_FEATURES) - X_min) * X_scale
+              ).reshape(1, FORECAST_HORIZON, N_FEATURES)
+    y_sc   = model.predict(X_sc, verbose=0).ravel()       # (576,)
+    y_pred = y_sc / y_scale + y_min
+
+    # 7. Timestamps
+    t_fc = pd.date_range(start=target_ts, periods=FORECAST_HORIZON, freq='5min')
+
+    # 8. Actual load (may be zeros/NaN for future dates)
+    y_actual = df['Load_Is'].values[fc_s:fc_e].astype(np.float32)
+    has_actual = np.any(y_actual > 50)
+
+    # 9. KPIs
+    if has_actual:
+        rmse, mae, mape = _compute_kpis(y_pred.reshape(1, -1), y_actual.reshape(1, -1))
+        print(f'\n  RMSE : {rmse:.1f} kW  |  MAE : {mae:.1f} kW  |  MAPE : {mape:.1f}%')
+    else:
+        rmse = mae = mape = None
+        print('\n  (No actual load data — KPIs not computed)')
+
+    # 10. Save CSV
+    export_date = (target_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    csv_path    = os.path.join(RESULTS_DIR, f'DNN_Prediction_{export_date}.csv')
+    df_out = pd.DataFrame({'Timestamp': t_fc, 'DNN_Load_kW': y_pred.round(1)})
+    if has_actual:
+        df_out['Load_Is_kW'] = y_actual.round(1)
+    df_out.to_csv(csv_path, index=False)
+    print(f'  Forecast CSV  : {csv_path}')
+
+    # 11. Plot
+    _plot_forecast(t_fc, y_pred,
+                   y_actual if has_actual else None,
+                   predict_date, rmse, mae, mape)
+
+    return y_pred, t_fc
+
+
+# ===========================================================================
 # ENTRY POINT
 # ===========================================================================
 
@@ -349,11 +482,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Simple DNN load forecast baseline',
         formatter_class=argparse.RawTextHelpFormatter,
-        epilog='Example:\n  python DNN_Load_Baseline.py --train')
-    parser.add_argument('--train', action='store_true', help='Train the model')
+        epilog='Examples:\n'
+               '  python DNN_Load_Baseline.py --train\n'
+               '  python DNN_Load_Baseline.py --predict 2026-03-01')
+    parser.add_argument('--train',   action='store_true',
+                        help='Train and evaluate the model')
+    parser.add_argument('--predict', metavar='YYYY-MM-DD',
+                        help='Run 48h forecast starting at midnight of this date')
     args = parser.parse_args()
 
     if args.train:
         run_train()
+    elif args.predict:
+        run_predict(args.predict)
     else:
         parser.print_help()

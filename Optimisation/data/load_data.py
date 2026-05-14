@@ -19,7 +19,7 @@ import pandas as pd
 import numpy as np
 
 # Path to the data file (one folder up from this file)
-DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'matis_2025_.xlsx')
+DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'Input', 'matis_2025_.xlsx')
 
 
 def load_data(start_date=None, end_date=None):

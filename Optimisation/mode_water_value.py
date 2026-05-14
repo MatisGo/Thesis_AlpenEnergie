@@ -28,7 +28,7 @@ to deviate during cheap intraday hours.
 import sys
 import pandas as pd
 from pyomo.environ import (
-    ConcreteModel, Set, Var, NonNegativeReals,
+    ConcreteModel, Set, Var, NonNegativeReals, Binary,
     Constraint, Objective, maximize, value, SolverFactory,
 )
 from hydro_constants import (
@@ -38,6 +38,7 @@ from hydro_constants import (
     BIDMI_LS_PER_MM, HASELHOLZ_LS_PER_MM,
     COEFF_M2_BIDMI, COEFF_M2_CASCADE, COEFF_M1_HASELHOLZ,
     TURBINE_CASCADE_RATIO, PEAK_TARIFF_EUR_KW,
+    PEAK_TARIFF_HOUR_START, PEAK_TARIFF_HOUR_END,
     water_balance_step, spill_to_kwh, attach_common_results,
 )
 from battery_control import (
@@ -52,9 +53,19 @@ from battery_control import (
 TERMINAL_FREE_ZONE = 100.0   # mm free zone — no penalty
 PW_ZONE2_WIDTH     = 100.0
 PW_ZONE3_WIDTH     = 100.0
-PW_SLOPE2          =   2.0   # EUR/mm
-PW_SLOPE3          =   8.0   # EUR/mm
-PW_SLOPE4          =  25.0   # EUR/mm
+# Slopes calibrated so implicit water value ≈ BG-short imbalance price (~233 EUR/MWh):
+#   M2 (Bidmi):      1 MWh uses 317.6 mm → break-even slope = 233/317.6 ≈ 0.73 EUR/mm
+#   M1 (Haselholz):  1 MWh uses 1674 mm  → break-even slope = 233/1674  ≈ 0.14 EUR/mm
+# Setting PW_SLOPE4 below the M1 break-even ensures both turbines run rather than hoarding water.
+PW_SLOPE2          =  0.03   # EUR/mm
+PW_SLOPE3          =  0.07   # EUR/mm
+PW_SLOPE4          =  0.12   # EUR/mm
+
+# Peak-tariff aggressivity multiplier (LP-only, does NOT affect the reported bill).
+# 1.0 = LP weighs the peak penalty at the real tariff rate (10 EUR/kW).
+# Higher values make the LP shave peaks more aggressively — at the cost of more
+# water spent. The reported total_peak_cost in run_optimiser.py is unchanged.
+PEAK_LP_MULTIPLIER = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +84,9 @@ def get_solver():
 # LP model builder
 # ---------------------------------------------------------------------------
 
-def _build_model(N, forecast, id_price, inflow_b, inflow_h,
+def _build_model(N, forecast, bg_long_fc, bg_short_fc, inflow_b, inflow_h,
                  lb0, lh0, target_lb, target_lh, battery_cfg=None,
-                 running_peak_kW=0.0, demand=None):
+                 running_peak_kW=0.0, demand=None, hours=None):
     """
     Build the WATER_VALUE LP.
 
@@ -109,16 +120,18 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
     m.spill_b = Var(m.T, domain=NonNegativeReals)
     m.spill_h = Var(m.T, domain=NonNegativeReals)
 
-    # Ramp constraints
-    def _ramp(m, t, var, direction):
-        if t < RAMP_WINDOW: return Constraint.Skip
-        diff = var[t] - var[t - RAMP_WINDOW] if direction == 'up' else var[t - RAMP_WINDOW] - var[t]
+    # Total ramp constraint — change in (M2 + M1) limited to RAMP_MAX kW per 15-min
+    # window. This is the real plant constraint (both turbines together).
+    def _ramp_total(m, t, direction):
+        if t < RAMP_WINDOW:
+            return Constraint.Skip
+        now  = m.P_M2[t]              + m.P_M1[t]
+        prev = m.P_M2[t - RAMP_WINDOW] + m.P_M1[t - RAMP_WINDOW]
+        diff = now - prev if direction == 'up' else prev - now
         return diff <= RAMP_MAX
 
-    m.ramp_m2_up = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M2, 'up'))
-    m.ramp_m2_dn = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M2, 'dn'))
-    m.ramp_m1_up = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M1, 'up'))
-    m.ramp_m1_dn = Constraint(m.T, rule=lambda m, t: _ramp(m, t, m.P_M1, 'dn'))
+    m.ramp_up = Constraint(m.T, rule=lambda m, t: _ramp_total(m, t, 'up'))
+    m.ramp_dn = Constraint(m.T, rule=lambda m, t: _ramp_total(m, t, 'dn'))
 
     # Water balance — uses turbine output only (battery is at grid connection,
     # not in the water circuit)
@@ -163,6 +176,14 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
             m.batt_SOC[t + 1] == m.batt_SOC[t]
                                + m.batt_c[t] * EFF_CHARGE    * TIMESTEP_HOURS
                                - m.batt_d[t] / EFF_DISCHARGE * TIMESTEP_HOURS)
+        # Binary mutual exclusion: at most one of (charge, discharge) per step.
+        # z=1 → charging allowed (discharge forced to 0); z=0 → discharging allowed.
+        # Makes the LP a MIP; GLPK handles it. Solves stay ~1–2 s per day.
+        m.batt_z          = Var(m.T, domain=Binary)
+        m.batt_c_no_wash  = Constraint(m.T, rule=lambda m, t:
+            m.batt_c[t] <= _P_MAX_BATT * m.batt_z[t])
+        m.batt_d_no_wash  = Constraint(m.T, rule=lambda m, t:
+            m.batt_d[t] <= _P_MAX_BATT * (1 - m.batt_z[t]))
         # Imbalance on NET GRID export: turbine + battery_net
         m.imbalance_con = Constraint(m.T, rule=lambda m, t:
             m.dev_pos[t] - m.dev_neg[t] ==
@@ -191,24 +212,36 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
             m.P_import[t] >= load[t] - (m.P_M2[t] + m.P_M1[t]))
 
     m.excess_peak = Var(domain=NonNegativeReals)
-    if B_BLOCKS > 0:
+    # Peak-tariff time window: only blocks whose 3 timesteps all fall inside
+    # [PEAK_TARIFF_HOUR_START, PEAK_TARIFF_HOUR_END) contribute to the bill.
+    if hours is None:
+        tariff_blocks = list(range(B_BLOCKS))
+    else:
+        tariff_blocks = [
+            b for b in range(B_BLOCKS)
+            if all(PEAK_TARIFF_HOUR_START <= hours[3*b + i] < PEAK_TARIFF_HOUR_END
+                   for i in range(3))
+        ]
+    if tariff_blocks:
         m.peak_block = Constraint(
-            list(range(B_BLOCKS)),
+            tariff_blocks,
             rule=lambda m, b: m.excess_peak >= (
                 m.P_import[3 * b] + m.P_import[3 * b + 1] + m.P_import[3 * b + 2]
             ) / 3.0 - running_peak_kW,
         )
 
-    # Objective — minimise ID imbalance cost + terminal penalties + peak tariff
-    imbalance_cost = sum(
-        abs(id_price[t]) * (m.dev_pos[t] + m.dev_neg[t]) * TIMESTEP_HOURS / 1000.0
+    # Objective — maximise imbalance revenue (asymmetric BG prices) − penalties
+    # dev_pos (long/over-production) earns/costs at BG-long forecast price.
+    # dev_neg (short/under-production) always costs at BG-short forecast price.
+    imbalance_revenue = sum(
+        (bg_long_fc[t] * m.dev_pos[t] - bg_short_fc[t] * m.dev_neg[t]) * TIMESTEP_HOURS / 1000.0
         for t in m.T)
     penalties = (
         - PW_SLOPE2 * (m.pw_b2 + m.pw_h2)
         - PW_SLOPE3 * (m.pw_b3 + m.pw_h3)
         - PW_SLOPE4 * (m.pw_b4 + m.pw_h4)
     )
-    peak_penalty = PEAK_TARIFF_EUR_KW * m.excess_peak
+    peak_penalty = PEAK_TARIFF_EUR_KW * PEAK_LP_MULTIPLIER * m.excess_peak
 
     # End-of-day SOC flexibility reserve penalty
     soc_penalty = 0
@@ -222,7 +255,18 @@ def _build_model(N, forecast, id_price, inflow_b, inflow_h,
         m.soc_dev_hi_con = Constraint(expr=m.dev_soc_hi >= m.batt_SOC[N] - soc_target_hi)
         soc_penalty = SOC_PENALTY_EUR_KWH * (m.dev_soc_lo + m.dev_soc_hi)
 
-    m.obj = Objective(expr=-imbalance_cost + penalties - peak_penalty - soc_penalty, sense=maximize)
+    # Battery cycling cost: marginal degradation per kWh moved (charge + discharge).
+    # Computed in run_optimiser.py from BATTERY_DEG_PER_CYCLE and BATTERY_COST_PER_KWH.
+    # Keeps the LP from chasing noise-driven small price differentials.
+    cycle_penalty = 0
+    if with_battery and battery_cfg.cycle_cost_eur_kwh > 0.0:
+        cycle_penalty = battery_cfg.cycle_cost_eur_kwh * sum(
+            (m.batt_c[t] + m.batt_d[t]) * TIMESTEP_HOURS
+            for t in m.T)
+
+    m.obj = Objective(expr=imbalance_revenue + penalties
+                            - peak_penalty - soc_penalty - cycle_penalty,
+                       sense=maximize)
     return m
 
 
@@ -243,18 +287,23 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
     """
     day_df      = day_df.reset_index(drop=True)
     N           = len(day_df)
-    forecast    = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
-    demand      = day_df['Consumption_kW'].tolist()
-    da_price    = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
-    id_price    = day_df['Intra_Day_Price_EUR_MWh'].tolist()
+    forecast      = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
+    demand        = day_df['Consumption_kW'].tolist()
+    forecast_cons = day_df['Forecast_Consumption_kW'].tolist()
+    da_price      = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
+    bg_long_fc  = day_df['BG_Long_Forecast_EUR_MWh'].tolist()   # LP uses forecast prices
+    bg_short_fc = day_df['BG_Short_Forecast_EUR_MWh'].tolist()
+    bg_long_r   = day_df['BG_Long_EUR_MWh'].tolist()            # post-settlement: real prices
+    bg_short_r  = day_df['BG_Short_EUR_MWh'].tolist()
     inflow_b    = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h    = day_df['Haselholz_Inflow_ls'].tolist()
+    hours       = day_df['DateTime'].dt.hour.tolist()   # peak-tariff window check
     with_batt   = battery_cfg is not None and battery_cfg.mode == 'INTRADAY'
 
-    model  = _build_model(N, forecast, id_price, inflow_b, inflow_h,
+    model  = _build_model(N, forecast, bg_long_fc, bg_short_fc, inflow_b, inflow_h,
                           lb0, lh0, target_lb, target_lh,
                           battery_cfg=battery_cfg if with_batt else None,
-                          running_peak_kW=running_peak_kW, demand=demand)
+                          running_peak_kW=running_peak_kW, demand=demand, hours=hours)
     result = solver.solve(model, tee=False)
     status = str(result.solver.termination_condition)
 
@@ -266,11 +315,20 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
             day_df, zeros, zeros, [lb0] * N, [lh0] * N, zeros, zeros,
             demand, target_lb, target_lh, mode_name='WATER_VALUE',
         )
-        day_df['Opt_DA_Trading_EUR']     = [
-            (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+        da_bid_list = [forecast[t] - forecast_cons[t] for t in range(N)]
+        day_df['Opt_DA_Trading_EUR']   = [
+            da_bid_list[t] * TIMESTEP_HOURS * da_price[t] / 1000.0
             for t in range(N)]
-        day_df['Opt_ID_Imbalance_EUR']   = [
-            -abs(forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        # Production = 0 in fallback; net = -demand[t]; dev = -demand[t] - da_bid
+        dev_fb = [-demand[t] - da_bid_list[t] for t in range(N)]
+        day_df['Opt_Imbalance_Long_EUR']  = [
+            max(0.0, dev_fb[t]) * bg_long_r[t]  * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        day_df['Opt_Imbalance_Short_EUR'] = [
+            min(0.0, dev_fb[t]) * bg_short_r[t] * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        day_df['Opt_ID_Imbalance_EUR'] = [
+            day_df['Opt_Imbalance_Long_EUR'].iloc[t] + day_df['Opt_Imbalance_Short_EUR'].iloc[t]
             for t in range(N)]
         day_df['Opt_Energy_Trading_EUR'] = [
             day_df['Opt_DA_Trading_EUR'].iloc[t] + day_df['Opt_ID_Imbalance_EUR'].iloc[t]
@@ -299,8 +357,10 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
         mode_name='WATER_VALUE',
     )
 
+    # DA bid = Forecast_Production - Forecast_Consumption (net position, no look-ahead)
+    da_bid_list  = [forecast[t] - forecast_cons[t] for t in range(N)]
     da_component = [
-        (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+        da_bid_list[t] * TIMESTEP_HOURS * da_price[t] / 1000.0
         for t in range(N)]
 
     if with_batt:
@@ -308,12 +368,20 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
         batt_d   = [value(model.batt_d[t])   for t in range(N)]
         batt_soc = [value(model.batt_SOC[t]) for t in range(N)]
 
-        grid_out = [opt_m2[t] + opt_m1[t] + batt_d[t] - batt_c[t] for t in range(N)]
-        id_component = [
-            -abs(grid_out[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        # ID imbalance: (actual net grid position) - DA bid
+        grid_out  = [opt_m2[t] + opt_m1[t] + batt_d[t] - batt_c[t] for t in range(N)]
+        dev_total = [(grid_out[t] - demand[t]) - da_bid_list[t] for t in range(N)]
+        dev_hydro = [(opt_m2[t] + opt_m1[t] - demand[t]) - da_bid_list[t] for t in range(N)]
+        # Split the metered (total) imbalance into long/short components
+        id_long = [
+            max(0.0, dev_total[t]) * bg_long_r[t]  * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
+        id_short = [
+            min(0.0, dev_total[t]) * bg_short_r[t] * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        id_component = [id_long[t] + id_short[t] for t in range(N)]
         id_hydro_only = [
-            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            dev_hydro[t] * (bg_long_r[t] if dev_hydro[t] >= 0 else bg_short_r[t]) * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
 
         day_df['Batt_Charge_kW']    = batt_c
@@ -323,13 +391,21 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh,
         day_df['Batt_Revenue_EUR']  = [id_component[t] - id_hydro_only[t] for t in range(N)]
         day_df._batt_soc_end        = value(model.batt_SOC[N])
     else:
-        id_component = [
-            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        # ID on (turbine - consumption) vs DA bid
+        dev = [(opt_m2[t] + opt_m1[t] - demand[t]) - da_bid_list[t] for t in range(N)]
+        id_long = [
+            max(0.0, dev[t]) * bg_long_r[t]  * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
+        id_short = [
+            min(0.0, dev[t]) * bg_short_r[t] * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        id_component = [id_long[t] + id_short[t] for t in range(N)]
 
-    day_df['Opt_DA_Trading_EUR']     = da_component
-    day_df['Opt_ID_Imbalance_EUR']   = id_component
-    day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
+    day_df['Opt_DA_Trading_EUR']      = da_component
+    day_df['Opt_Imbalance_Long_EUR']  = id_long
+    day_df['Opt_Imbalance_Short_EUR'] = id_short
+    day_df['Opt_ID_Imbalance_EUR']    = id_component
+    day_df['Opt_Energy_Trading_EUR']  = [da_component[t] + id_component[t] for t in range(N)]
     day_df['Forecast_Drift_kW']      = [
         (opt_m2[t] + opt_m1[t]) - forecast[t] for t in range(N)]
 

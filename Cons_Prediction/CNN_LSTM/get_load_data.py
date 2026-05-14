@@ -37,6 +37,21 @@ EXTEND_DAYS_AHEAD = 10    # generate calendar rows up to today + this many days
 STEP_MINUTES      = 5     # resolution of the Excel (5-min)
 SIGNALNAME_ROW    = 3     # openpyxl row number containing signal names in the Excel
 FIRST_DATA_ROW    = 4     # openpyxl row number of first actual data row
+GAP_CHECK_DAYS    = 14    # how many past days to check for missing data
+
+# Canonical Excel name for the net load signal (used by the gap check)
+LOAD_IS_SIGNAL = 'PR_MI_SDR___:Prog:EWO_Last:IST_wert/t'
+
+# Signal aliases: maps current SCADA export names → canonical Excel row-3 names.
+# Add entries here whenever the SCADA system renames a signal.
+SIGNAL_ALIASES = {
+    # Renamed 2026 — Load_Is (net consumption)
+    'PR_MI_SDR___:Prog:EWO:Last_Netto:IST:IST_wert/t':  'PR_MI_SDR___:Prog:EWO_Last:IST_wert/t',
+    # Renamed 2026 — Production forecast (col F)
+    'PR_MI_SDR___:IO:Slot2:Prog_EWO_EGSHydro:IST_wert/t': 'PR_MI_SDR___:IO:Slot2:Prog_EWO_Prod:IST_wert/t',
+    # Renamed 2026 — Load forecast (col G)
+    'PR_MI_SDR___:IO:Slot2:Prog_EWO_LGS:IST_wert/t':    'PR_MI_SDR___:IO:Slot2:Prog_EWO_Last:IST_wert/t',
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -156,8 +171,11 @@ def import_csv(csv_path: str, ws, ts_index: dict, signal_index: dict):
     # Map CSV column index (0-based within data values) → Excel column number
     col_map = {}
     for i, sig in enumerate(csv_signals):
-        if sig in signal_index:
-            col_map[i] = signal_index[sig]
+        canonical = SIGNAL_ALIASES.get(sig, sig)
+        if canonical in signal_index:
+            if canonical != sig:
+                print(f"    INFO: alias resolved '{sig}' → '{canonical}'")
+            col_map[i] = signal_index[canonical]
         else:
             print(f"    WARNING: signal not found in Excel — '{sig}'")
 
@@ -245,6 +263,51 @@ def import_csv(csv_path: str, ws, ts_index: dict, signal_index: dict):
     print(f"    Written: {written} rows  |  Skipped (no match): {skipped} rows")
 
 
+# ── Job 3: data gap check ─────────────────────────────────────────────────────
+def check_data_gaps(ws, signal_index: dict, days: int = GAP_CHECK_DAYS):
+    """Warn about any day in the last `days` days that has no Load_Is values."""
+    load_is_col = signal_index.get(LOAD_IS_SIGNAL)
+    if load_is_col is None:
+        print("  [Gap check] Load_Is column not found in Excel — skipping.")
+        return
+
+    today      = datetime.date.today()
+    check_from = today - datetime.timedelta(days=days)
+    check_to   = today - datetime.timedelta(days=1)   # yesterday; today not expected yet
+
+    dates_with_data = set()
+    for r in range(FIRST_DATA_ROW, ws.max_row + 1):
+        ts = _norm_ts(ws.cell(row=r, column=1).value)
+        if ts is None:
+            continue
+        try:
+            d = datetime.datetime.strptime(ts, '%d.%m.%Y %H:%M:%S').date()
+        except ValueError:
+            continue
+        if check_from <= d <= check_to:
+            if ws.cell(row=r, column=load_is_col).value is not None:
+                dates_with_data.add(d)
+
+    missing = []
+    d = check_from
+    while d <= check_to:
+        if d not in dates_with_data:
+            missing.append(d)
+        d += datetime.timedelta(days=1)
+
+    if missing:
+        print()
+        print('!' * 60)
+        print('  ATTENTION — missing load data detected in the last 2 weeks:')
+        for m in missing:
+            print(f"  !  {m.strftime('%A %d.%m.%Y')} — no data found.")
+        print('  Please import these days to have a more accurate forecast.')
+        print('!' * 60)
+        print()
+    else:
+        print(f"  Data gap check OK — all {days} days present.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     today    = datetime.date.today()
@@ -270,19 +333,24 @@ def main():
     extend_calendar(ws, holidays, end_dt)
 
     # ── Job 2: import CSV files ────────────────────────────────────────────
+    # signal_index is always built — needed by both the CSV import and gap check
+    signal_index = build_signal_index(ws)
+
     csv_files = sorted(glob.glob(os.path.join(INPUT_DIR, '*.csv')))
     if not csv_files:
         print(f"\n[2] No CSV files found in {INPUT_DIR}")
     else:
         print(f"\n[2] Importing {len(csv_files)} CSV file(s) from Input/ ...")
-        # Build lookup tables once (after calendar extension so new rows are included)
-        ts_index     = build_ts_index(ws)
-        signal_index = build_signal_index(ws)
+        ts_index = build_ts_index(ws)
         print(f"    Excel rows indexed : {len(ts_index)}")
         print(f"    Signals in Excel   : {len(signal_index)}")
 
         for csv_path in csv_files:
             import_csv(csv_path, ws, ts_index, signal_index)
+
+    # ── Job 3: data gap check ──────────────────────────────────────────────
+    print("\n[3] Checking data completeness (last 2 weeks) ...")
+    check_data_gaps(ws, signal_index)
 
     # ── Save ───────────────────────────────────────────────────────────────
     wb.save(EXCEL_PATH)

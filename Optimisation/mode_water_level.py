@@ -36,10 +36,12 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
     """
     day_df   = day_df.reset_index(drop=True)
     N        = len(day_df)
-    demand   = day_df['Consumption_kW'].tolist()
-    da_price = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
-    id_price = day_df['Intra_Day_Price_EUR_MWh'].tolist()
-    forecast = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
+    demand        = day_df['Consumption_kW'].tolist()
+    forecast_cons = day_df['Forecast_Consumption_kW'].tolist()
+    da_price      = day_df['Day_Ahead_Price_EUR_MWh'].tolist()
+    bg_long_r     = day_df['BG_Long_EUR_MWh'].tolist()   # real prices for settlement
+    bg_short_r    = day_df['BG_Short_EUR_MWh'].tolist()
+    forecast      = [max(0.0, float(day_df.loc[t, 'Forecast_kW'])) for t in range(N)]
     inflow_b = day_df['Bidmi_Inflow_ls'].tolist()
     inflow_h = day_df['Haselholz_Inflow_ls'].tolist()
 
@@ -61,9 +63,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
         # For HYBRID, soc_max_override caps INTRADAY zone below the DA block floor.
         if co_sim:
             batt_soc_list.append(soc)
-            soc_max_eff = battery_cfg.soc_max_override  # None → uses global SOC_MAX
-            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh,
-                                                         soc_max_eff=soc_max_eff)
+            batt_c, batt_d, soc = battery_step_forecast(soc, norm_lb, norm_lh)
         else:
             batt_c = batt_d = 0.0
         batt_c_list.append(batt_c)
@@ -90,7 +90,7 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
         else:
             m2, m1 = ref_m2, ref_m1
 
-        lb, lh, spill_b, spill_h = water_balance_step(lb, lh, m2, m1, inflow_b[t], inflow_h[t])
+        lb, lh, spill_b, spill_h, m2, m1 = water_balance_step(lb, lh, m2, m1, inflow_b[t], inflow_h[t])
 
         opt_m2.append(m2);  opt_m1.append(m1)
         opt_lb.append(lb);  opt_lh.append(lh)
@@ -103,18 +103,27 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
         mode_name='WATER_LEVEL',
     )
 
+    # DA bid = Forecast_Production - Forecast_Consumption (net position, no look-ahead)
+    da_bid_list  = [forecast[t] - forecast_cons[t] for t in range(N)]
     da_component = [
-        (forecast[t] - demand[t]) * TIMESTEP_HOURS * da_price[t] / 1000.0
+        da_bid_list[t] * TIMESTEP_HOURS * da_price[t] / 1000.0
         for t in range(N)]
 
     if co_sim:
-        grid_out = [opt_m2[t] + opt_m1[t] + batt_d_list[t] - batt_c_list[t]
-                    for t in range(N)]
-        id_component = [
-            -abs(grid_out[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        grid_out  = [opt_m2[t] + opt_m1[t] + batt_d_list[t] - batt_c_list[t]
+                     for t in range(N)]
+        dev_total = [(grid_out[t] - demand[t]) - da_bid_list[t] for t in range(N)]
+        # Split the metered (total) imbalance into long/short components
+        id_long = [
+            max(0.0, dev_total[t]) * bg_long_r[t]  * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
+        id_short = [
+            min(0.0, dev_total[t]) * bg_short_r[t] * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        id_component = [id_long[t] + id_short[t] for t in range(N)]
+        dev_hydro = [(opt_m2[t] + opt_m1[t] - demand[t]) - da_bid_list[t] for t in range(N)]
         id_hydro_only = [
-            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+            dev_hydro[t] * (bg_long_r[t] if dev_hydro[t] >= 0 else bg_short_r[t]) * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
         day_df['Batt_Charge_kW']    = batt_c_list
         day_df['Batt_Discharge_kW'] = batt_d_list
@@ -123,13 +132,20 @@ def dispatch_day(day_df, lb0, lh0, target_lb, target_lh, battery_cfg=None,
         day_df['Batt_Revenue_EUR']  = [id_component[t] - id_hydro_only[t] for t in range(N)]
         day_df._batt_soc_end        = soc
     else:
-        id_component = [
-            -abs(opt_m2[t] + opt_m1[t] - forecast[t]) * TIMESTEP_HOURS * id_price[t] / 1000.0
+        dev = [(opt_m2[t] + opt_m1[t] - demand[t]) - da_bid_list[t] for t in range(N)]
+        id_long = [
+            max(0.0, dev[t]) * bg_long_r[t]  * TIMESTEP_HOURS / 1000.0
             for t in range(N)]
+        id_short = [
+            min(0.0, dev[t]) * bg_short_r[t] * TIMESTEP_HOURS / 1000.0
+            for t in range(N)]
+        id_component = [id_long[t] + id_short[t] for t in range(N)]
 
-    day_df['Opt_DA_Trading_EUR']     = da_component
-    day_df['Opt_ID_Imbalance_EUR']   = id_component
-    day_df['Opt_Energy_Trading_EUR'] = [da_component[t] + id_component[t] for t in range(N)]
+    day_df['Opt_DA_Trading_EUR']      = da_component
+    day_df['Opt_Imbalance_Long_EUR']  = id_long
+    day_df['Opt_Imbalance_Short_EUR'] = id_short
+    day_df['Opt_ID_Imbalance_EUR']    = id_component
+    day_df['Opt_Energy_Trading_EUR']  = [da_component[t] + id_component[t] for t in range(N)]
     day_df['Forecast_Drift_kW']      = [
         (opt_m2[t] + opt_m1[t]) - forecast[t] for t in range(N)]
 

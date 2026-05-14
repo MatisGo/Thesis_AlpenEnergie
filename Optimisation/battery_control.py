@@ -56,7 +56,7 @@ import sys
 from dataclasses import dataclass
 
 from pyomo.environ import (
-    ConcreteModel, Set, Var, NonNegativeReals,
+    ConcreteModel, Set, Var, NonNegativeReals, Binary,
     Constraint, Objective, maximize, value, SolverFactory,
 )
 from hydro_constants import TIMESTEP_HOURS
@@ -73,17 +73,22 @@ class BatteryConfig:
     mode : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
            'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
     soc0 : SOC at start of the day [kWh], carried from previous day.
+    cycle_cost_eur_kwh : marginal cost per kWh moved through the battery
+                         (charge AND discharge). Used as a penalty in the
+                         WATER_VALUE LP so it only cycles when expected
+                         price spread exceeds wear cost. 0.0 disables.
 
     Pass None instead of a BatteryConfig to signal battery inactive.
     """
     mode: str
     soc0: float
+    cycle_cost_eur_kwh: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Battery specifications
 # ---------------------------------------------------------------------------
 
-CAPACITY_KWH    = 200   # 1 MWh
+CAPACITY_KWH    = 500   # 1 MWh
 EFF_CHARGE      = math.sqrt(0.80)          
 EFF_DISCHARGE   = math.sqrt(0.80)          
 ROUND_TRIP_EFF  = EFF_CHARGE * EFF_DISCHARGE  # = 0.80
@@ -103,8 +108,8 @@ CYCLE_KWH   = CAPACITY_KWH                               # 1 full cycle = full u
 # ---------------------------------------------------------------------------
 # End-of-day SOC target range  (flexibility reserve)
 # ---------------------------------------------------------------------------
-SOC_TARGET_LO_PCT   = 0.50   # lower bound of target range (fraction of usable SOC range)
-SOC_TARGET_HI_PCT   = 0.60   # upper bound of target range (fraction of usable SOC range)
+SOC_TARGET_LO_PCT   = 0.40   # lower bound of target range (fraction of usable SOC range)
+SOC_TARGET_HI_PCT   = 0.70   # upper bound of target range (fraction of usable SOC range)
 SOC_PENALTY_EUR_KWH = 0.002  # EUR per kWh of end-of-day SOC deviation from target range
 
 # ---------------------------------------------------------------------------
@@ -113,7 +118,7 @@ SOC_PENALTY_EUR_KWH = 0.002  # EUR per kWh of end-of-day SOC deviation from targ
 # 0.5 C means the battery can charge or discharge at 50 % of its nominal
 # capacity per hour.  For a 200 kWh battery: P_max = 0.5 × 200 = 100 kW.
 # This value caps both the rule-based controller and the LP variable bounds.
-C_RATE      = 0.5                               # C  (change here to adjust power limit)
+C_RATE      = 1                              # C  (change here to adjust power limit)
 _P_MAX_BATT = round(C_RATE * CAPACITY_KWH, 3)  # kW — used as LP upper bound
 
 
@@ -156,6 +161,15 @@ def _build_da_model(N, da_price, soc0):
     # (tight physical ceiling; keeps GLPK numerically stable)
     m.charge    = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
     m.discharge = Var(m.T, domain=NonNegativeReals, bounds=(0, _P_MAX_BATT))
+
+    # Binary mutual exclusion: z=1 charge allowed, z=0 discharge allowed.
+    # Prevents the LP from picking a degenerate wash-trade solution that
+    # would be physically impossible on real hardware.
+    m.z          = Var(m.T, domain=Binary)
+    m.c_no_wash  = Constraint(m.T, rule=lambda m, t:
+        m.charge[t]    <= _P_MAX_BATT * m.z[t])
+    m.d_no_wash  = Constraint(m.T, rule=lambda m, t:
+        m.discharge[t] <= _P_MAX_BATT * (1 - m.z[t]))
 
     # State of charge
     # SOC[0] is fixed — apply bounds only to t >= 1 to avoid floating-point
