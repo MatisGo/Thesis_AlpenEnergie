@@ -6,7 +6,7 @@ forecast variants used by the value-of-information study.
 
 Variants
 --------
-  REAL          : actual realised prices (perfect foresight benchmark)
+  PERFECT       : actual realised prices (perfect foresight benchmark)
   ROLLING_MEAN  : 7-day rolling mean shifted 1 day forward (today's operational
                   forecast; empirical R^2 ~ 0.06, measured below)
   R2_02         : synthetic AR(1) noise calibrated to R^2 = 0.2
@@ -186,7 +186,7 @@ def main():
 
     # ---- Synthetic AR(1) variants (independent BG_Long / BG_Short noise) --
     forecasts = {
-        'Real':         (real_l, real_s),
+        'Perfect':      (real_l, real_s),
         'Rolling_Mean': (cur_l,  cur_s),
     }
     for target_r2 in TARGET_R2_VARIANTS:

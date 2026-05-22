@@ -22,7 +22,7 @@ Modes
               Prices for the full day are known before dispatch → globally optimal.
               The battery is independent of the hydro plant.
 
-  INTRADAY  : Rule-based causal controller triggered by reservoir fill levels.
+  HYDRO_COUPLED : Rule-based causal controller triggered by reservoir fill levels.
               Thresholds (90 % / 35 % of usable range) are checked each timestep
               using the reservoir levels produced by the hydro dispatch.
 
@@ -71,7 +71,7 @@ class BatteryConfig:
     """Immutable battery configuration passed into every dispatch_day function.
 
     mode : 'DAY_AHEAD' — LP arbitrage, fully independent of hydro.
-           'INTRADAY'  — reservoir-triggered co-simulation inside hydro dispatch.
+           'HYDRO_COUPLED'  — reservoir-triggered co-simulation inside hydro dispatch.
     soc0 : SOC at start of the day [kWh], carried from previous day.
     cycle_cost_eur_kwh : marginal cost per kWh moved through the battery
                          (charge AND discharge). Used as a penalty in the
@@ -118,19 +118,25 @@ SOC_PENALTY_EUR_KWH = 0.002  # EUR per kWh of end-of-day SOC deviation from targ
 # 0.5 C means the battery can charge or discharge at 50 % of its nominal
 # capacity per hour.  For a 200 kWh battery: P_max = 0.5 × 200 = 100 kW.
 # This value caps both the rule-based controller and the LP variable bounds.
-C_RATE      = 1                              # C  (change here to adjust power limit)
+C_RATE      = 0.5                              # C  (change here to adjust power limit)
 _P_MAX_BATT = round(C_RATE * CAPACITY_KWH, 3)  # kW — used as LP upper bound
 
 
 # ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
+# Time limit for GLPK branch-and-bound on the DAY_AHEAD MIP.
+# Days with negative DA prices produce tight binary constraints that can
+# stall GLPK indefinitely.  30 s is more than enough to reach near-optimality
+# on the 288-step problem; GLPK returns the best integer solution found so far.
+BATTERY_SOLVER_TIMELIMIT = 30  # seconds
 
 def get_battery_solver():
     solver = SolverFactory('glpk')
     if not solver.available():
         print("ERROR: GLPK not found.  Install via: conda install glpk")
         sys.exit(1)
+    solver.options['tmlim'] = BATTERY_SOLVER_TIMELIMIT
     return solver
 
 
@@ -198,7 +204,7 @@ def _build_da_model(N, da_price, soc0):
 
 
 # ---------------------------------------------------------------------------
-# INTRADAY mode — per-step causal controller  (called inside hydro dispatch)
+# HYDRO_COUPLED mode — per-step causal controller  (called inside hydro dispatch)
 # ---------------------------------------------------------------------------
 
 # Reservoir fill thresholds that trigger battery action
@@ -210,7 +216,7 @@ DISCHARGE_THRESHOLD = 0.30   # discharge when fill < 30 %
 
 def battery_step_forecast(soc, fill_b, fill_h):
     """
-    Compute one 5-min timestep of the INTRADAY battery controller.
+    Compute one 5-min timestep of the HYDRO_COUPLED battery controller.
 
     Called at every timestep from inside the hydro dispatch loop so that
     the battery decision and the water-balance update share the same clock.
@@ -281,7 +287,7 @@ def dispatch_day_battery(day_df, soc0, solver, mode='DAY_AHEAD'):
               Intra_Day_Price_EUR_MWh, Opt_Production_kW, Forecast_kW)
     soc0    : starting SOC [kWh]
     solver  : Pyomo solver (from get_battery_solver()); unused for FORECAST mode
-    mode    : 'DAY_AHEAD' | 'INTRADAY'
+    mode    : 'DAY_AHEAD' | 'HYDRO_COUPLED'
 
     Returns
     -------
@@ -296,24 +302,40 @@ def dispatch_day_battery(day_df, soc0, solver, mode='DAY_AHEAD'):
     if mode != 'DAY_AHEAD':
         raise ValueError(
             f"dispatch_day_battery only handles 'DAY_AHEAD'. "
-            f"INTRADAY battery is co-simulated inside the hydro dispatch loop.")
+            f"HYDRO_COUPLED battery is co-simulated inside the hydro dispatch loop.")
 
     model  = _build_da_model(N, da_price, soc0)
     result = solver.solve(model, tee=False)
     status = str(result.solver.termination_condition)
 
-    if status not in ('optimal', 'feasible'):
+    if status in ('optimal', 'feasible'):
+        charge    = [value(model.charge[t])    for t in range(N)]
+        discharge = [value(model.discharge[t]) for t in range(N)]
+        soc       = [value(model.SOC[t])       for t in range(N)]
+        soc_end   = value(model.SOC[N])
+    elif status == 'maxTimeLimit':
+        # GLPK hit the time limit — attempt to recover the best integer solution found.
+        try:
+            charge    = [value(model.charge[t])    for t in range(N)]
+            discharge = [value(model.discharge[t]) for t in range(N)]
+            soc       = [value(model.SOC[t])       for t in range(N)]
+            soc_end   = value(model.SOC[N])
+            print(f"  BATTERY NOTE: GLPK hit {BATTERY_SOLVER_TIMELIMIT}s limit on "
+                  f"{day_df.loc[0, 'DateTime'].date()} — using best feasible solution found")
+        except Exception:
+            print(f"  BATTERY WARNING: GLPK timed out with no feasible solution on "
+                  f"{day_df.loc[0, 'DateTime'].date()} — battery inactive")
+            charge    = [0.0] * N
+            discharge = [0.0] * N
+            soc       = [soc0] * N
+            soc_end   = soc0
+    else:
         print(f"  BATTERY WARNING: solver '{status}' on "
               f"{day_df.loc[0, 'DateTime'].date()} — battery inactive")
         charge    = [0.0] * N
         discharge = [0.0] * N
         soc       = [soc0] * N
         soc_end   = soc0
-    else:
-        charge    = [value(model.charge[t])    for t in range(N)]
-        discharge = [value(model.discharge[t]) for t in range(N)]
-        soc       = [value(model.SOC[t])       for t in range(N)]
-        soc_end   = value(model.SOC[N])
 
     day_df['Batt_Charge_kW']    = charge
     day_df['Batt_Discharge_kW'] = discharge

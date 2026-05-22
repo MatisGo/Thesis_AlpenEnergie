@@ -7,7 +7,7 @@ consumption-forecast variants for the value-of-information study.
 Variants
 --------
   PERFECT  : Forecast = real consumption (zero error, theoretical upper bound)
-  CURRENT  : The existing CNN-LSTM forecast (already in matis_2025_.xlsx)
+  CNN_LSTM : The existing CNN-LSTM forecast (already in matis_2025_.xlsx)
   MAPE_10  : Synthetic forecast with target MAPE ~ 10%
   MAPE_15  : Synthetic forecast with target MAPE ~ 15%
   MAPE_20  : Synthetic forecast with target MAPE ~ 20%
@@ -194,8 +194,8 @@ def main():
 
     # ── Build variants ─────────────────────────────────────────────────
     variants = {
-        'Perfect': real.copy(),
-        'Current': cnn.copy(),
+        'Perfect':  real.copy(),
+        'CNN_LSTM': cnn.copy(),
     }
     for target_wmape in TARGET_WMAPE_VARIANTS:
         tag   = f'MAPE_{int(round(target_wmape * 100)):02d}'

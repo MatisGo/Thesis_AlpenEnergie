@@ -96,7 +96,7 @@ DATA_FILENAME = os.path.join('Input', 'matis_2025_.xlsx')
 # Use the short tag in run_optimiser.py's IMBALANCE_FORECAST setting.
 IMBALANCE_FORECASTS_PATH = os.path.join('Input', 'imbalance_forecasts.xlsx')
 IMBALANCE_VARIANT_TAGS = {
-    'REAL':         'Real',          # perfect foresight (uses realised BG prices)
+    'PERFECT':      'Perfect',       # perfect foresight (uses realised BG prices)
     'ROLLING_MEAN': 'Rolling_Mean',  # 7-day rolling mean shifted 1 day (today's method)
     'R2_02':        'R2_20',         # synthetic AR(1) noise, R^2 = 0.2
     'R2_05':        'R2_50',         # synthetic AR(1) noise, R^2 = 0.5
@@ -108,7 +108,7 @@ IMBALANCE_VARIANT_TAGS = {
 CONSUMPTION_FORECASTS_PATH = os.path.join('Input', 'consumption_forecasts.xlsx')
 CONSUMPTION_VARIANT_TAGS = {
     'PERFECT':  'Perfect',     # zero-error (forecast = real)
-    'CURRENT':  'Current',     # existing CNN-LSTM forecast (WMAPE ~6%)
+    'CNN_LSTM': 'CNN_LSTM',    # existing CNN-LSTM forecast (WMAPE ~6%)
     'MAPE_10':  'MAPE_10',     # synthetic, hour-of-day-conditional, WMAPE ~10%
     'MAPE_15':  'MAPE_15',     # synthetic, WMAPE ~15%
     'MAPE_20':  'MAPE_20',     # synthetic, WMAPE ~20%
@@ -129,8 +129,8 @@ DA_PRICE_VARIANT_TAGS = {
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(path: str, imbalance_forecast: str = 'CURRENT',
-              consumption_forecast: str = 'CURRENT',
+def load_data(path: str, imbalance_forecast: str = 'ROLLING_MEAN',
+              consumption_forecast: str = 'CNN_LSTM',
               da_price_forecast: str = 'PERFECT') -> pd.DataFrame:
     """Read matis_2025_.xlsx and return a clean DataFrame.
 
@@ -193,7 +193,7 @@ def load_data(path: str, imbalance_forecast: str = 'CURRENT',
     if cons_variant_tag is None:
         raise ValueError(f"Unknown consumption_forecast '{consumption_forecast}'. "
                          f"Choices: {list(CONSUMPTION_VARIANT_TAGS.keys())}")
-    if consumption_forecast != 'CURRENT':
+    if consumption_forecast != 'CNN_LSTM':
         _cons_path = os.path.join(os.path.dirname(path), '..', 'Input', 'consumption_forecasts.xlsx')
         _cons_path = os.path.normpath(_cons_path)
         if not os.path.exists(_cons_path):
@@ -429,7 +429,7 @@ def attach_common_results(day_df, opt_m2, opt_m1, opt_lb, opt_lh,
     """Add all standard Opt_* columns to day_df in-place.
 
     NOTE: Opt_Energy_Trading_EUR is intentionally NOT set here.
-    Each mode (FORECAST, WATER_VALUE, WATER_LEVEL) writes its own
+    Each mode (RULE_BASED_DISPATCH, OPTIMISATION_DISPATCH) writes its own
     DA + ID formula immediately after calling this function.
     """
     N     = len(day_df)
